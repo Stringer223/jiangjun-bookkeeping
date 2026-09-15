@@ -1,0 +1,27 @@
+{
+  "name": "jiangjun-bookkeeping",
+  "version": "0.1.0",
+  "description": "将军记账 —— 本地记账 App",
+  "main": "./out/main/index.js",
+  "author": "jiangjun",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "package:win": "electron-vite build && electron-builder --win"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@vitejs/plugin-vue": "^5.0.4",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.3.0",
+    "naive-ui": "^2.38.2",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1",
+    "vue": "^3.4.27",
+    "vue-tsc": "^2.0.19"
+  }
+}

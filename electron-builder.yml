@@ -1,0 +1,18 @@
+appId: com.jiangjun.bookkeeping
+productName: 将军记账
+electronDist: node_modules/electron/dist
+directories:
+  buildResources: build
+files:
+  - out/**
+  - "!src/*"
+  - "!electron.vite.config.{js,ts,mjs,cjs}"
+  - "!**/.vscode/*"
+win:
+  target:
+    - nsis
+  signAndEditExecutable: false
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: ${productName}-${version}-setup.${ext}

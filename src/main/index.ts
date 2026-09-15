@@ -5,6 +5,7 @@ import {
   load,
   getCategories,
   setCategories,
+  countCategoryUsage,
   listExpenses,
   addExpense,
   updateExpense,
@@ -48,6 +49,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('categories:get', () => getCategories())
   ipcMain.handle('categories:set', (_e, categories: Category[]) => setCategories(categories))
+  ipcMain.handle('categories:usage', (_e, categoryId: string) => countCategoryUsage(categoryId))
   ipcMain.handle('expenses:list', (_e, filter?: ExpenseFilter) => listExpenses(filter))
   ipcMain.handle('expenses:add', (_e, input: Omit<Expense, 'id' | 'createdAt'>) => addExpense(input))
   ipcMain.handle('expenses:update', (_e, expense: Expense) => updateExpense(expense))

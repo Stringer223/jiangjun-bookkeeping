@@ -17,11 +17,28 @@ const DEFAULT_CATEGORY_DEFS: { name: string; children: string[] }[] = [
   { name: '其他', children: ['其他杂项'] }
 ]
 
+/** 预置分类 id 集合（用于识别/迁移：预置分类锁定，不可改名或删除） */
+const PRESET_IDS = new Set<string>()
+DEFAULT_CATEGORY_DEFS.forEach((def, i) => {
+  PRESET_IDS.add(`c${i + 1}`)
+  def.children.forEach((_, j) => PRESET_IDS.add(`c${i + 1}-${j + 1}`))
+})
+
 export function buildDefaultCategories(): Category[] {
   return DEFAULT_CATEGORY_DEFS.map((def, i) => ({
     id: `c${i + 1}`,
     name: def.name,
-    children: def.children.map((name, j) => ({ id: `c${i + 1}-${j + 1}`, name }))
+    isPreset: true,
+    children: def.children.map((name, j) => ({ id: `c${i + 1}-${j + 1}`, name, isPreset: true }))
+  }))
+}
+
+/** 依据 id 校正 isPreset 标记（兼容旧数据迁移，并防止预置分类被误标为用户分类） */
+function markPreset(categories: Category[]): Category[] {
+  return categories.map((c) => ({
+    ...c,
+    isPreset: PRESET_IDS.has(c.id),
+    children: (c.children ?? []).map((s) => ({ ...s, isPreset: PRESET_IDS.has(s.id) }))
   }))
 }
 
@@ -52,6 +69,7 @@ export async function load(): Promise<void> {
     db.categories = buildDefaultCategories()
   }
   if (!Array.isArray(db.expenses)) db.expenses = []
+  db.categories = markPreset(db.categories)
 }
 
 async function persist(): Promise<void> {
@@ -64,9 +82,17 @@ export function getCategories(): Category[] {
 }
 
 export async function setCategories(categories: Category[]): Promise<Category[]> {
-  db.categories = categories
+  db.categories = markPreset(categories)
   await persist()
   return db.categories
+}
+
+/** 统计某分类（含其所有二级小类）被多少条账目引用，用于删除前校验 */
+export function countCategoryUsage(categoryId: string): number {
+  const ids = new Set<string>([categoryId])
+  const top = db.categories.find((c) => c.id === categoryId)
+  top?.children?.forEach((s) => ids.add(s.id))
+  return db.expenses.filter((e) => ids.has(e.categoryId)).length
 }
 
 export function listExpenses(filter?: ExpenseFilter): Expense[] {

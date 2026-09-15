@@ -4,6 +4,7 @@ import type { Api, Category, Expense, ExpenseFilter } from '../shared/types'
 const api: Api = {
   getCategories: () => ipcRenderer.invoke('categories:get'),
   setCategories: (categories: Category[]) => ipcRenderer.invoke('categories:set', categories),
+  countCategoryUsage: (categoryId: string) => ipcRenderer.invoke('categories:usage', categoryId),
   listExpenses: (filter?: ExpenseFilter) => ipcRenderer.invoke('expenses:list', filter),
   addExpense: (input) => ipcRenderer.invoke('expenses:add', input),
   updateExpense: (expense: Expense) => ipcRenderer.invoke('expenses:update', expense),

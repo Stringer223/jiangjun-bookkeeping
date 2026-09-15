@@ -5,6 +5,8 @@ export interface Category {
   id: string
   name: string
   children?: Category[]
+  /** 是否为预置分类（true = 锁定，不可改名/删除；用户自建为 false） */
+  isPreset?: boolean
 }
 
 /** 一笔花销记录。金额以「分」为单位存储，避免浮点误差 */
@@ -29,6 +31,7 @@ export interface ExpenseFilter {
 export interface Api {
   getCategories: () => Promise<Category[]>
   setCategories: (categories: Category[]) => Promise<Category[]>
+  countCategoryUsage: (categoryId: string) => Promise<number>
   listExpenses: (filter?: ExpenseFilter) => Promise<Expense[]>
   addExpense: (input: Omit<Expense, 'id' | 'createdAt'>) => Promise<Expense>
   updateExpense: (expense: Expense) => Promise<Expense>

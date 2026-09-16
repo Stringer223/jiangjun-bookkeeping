@@ -5,6 +5,7 @@ import RecordView from './views/RecordView.vue'
 import ListView from './views/ListView.vue'
 import StatsView from './views/StatsView.vue'
 import CategoryView from './views/CategoryView.vue'
+import GameView from './views/GameView.vue'
 
 const activeKey = ref('record')
 
@@ -12,7 +13,8 @@ const menuOptions = [
   { label: '记一笔', key: 'record' },
   { label: '账单', key: 'list' },
   { label: '统计', key: 'stats' },
-  { label: '分类管理', key: 'category' }
+  { label: '分类管理', key: 'category' },
+  { label: '休闲', key: 'game' }
 ]
 
 const activeView = computed(() => {
@@ -23,6 +25,8 @@ const activeView = computed(() => {
       return StatsView
     case 'category':
       return CategoryView
+    case 'game':
+      return GameView
     default:
       return RecordView
   }

@@ -95,6 +95,13 @@ function dataPath(): string {
   return join(app.getPath('userData'), 'data.json')
 }
 
+/**
+ * 把数据文件载入到内存。文件不存在、内容损坏、读取失败都走 catch，
+ * 一律回落到默认分类并立即落盘。
+ *
+ * 注意这个 catch 不区分错误类型：如果 dataPath() 算错了路径，
+ * 表现会是「账目突然全没了」而不是报错，排查时先怀疑这里。
+ */
 export async function load(): Promise<void> {
   try {
     const raw = await fs.readFile(dataPath(), 'utf-8')
@@ -137,6 +144,16 @@ export function countCategoryUsage(categoryId: string): number {
   return db.expenses.filter((e) => ids.has(e.categoryId)).length
 }
 
+/**
+ * 按条件筛选账单，返回「日期倒序、同日按录入时间倒序」的新数组。
+ *
+ * 多个筛选条件是叠加关系（AND）。几个契约细节，调用方容易猜错：
+ * - start / end 是闭区间，且按字符串字典序比较，因此 date 必须始终是 'YYYY-MM-DD'
+ * - categoryId 是精确匹配，传一级大类 id 不会自动带上它的二级小类
+ *   （注意这与 countCategoryUsage 的行为不同，那边是含子类的）
+ * - keyword 只搜 note，不搜分类名；忽略大小写与首尾空格，纯空白视为未填
+ * - 返回的是新数组，调用方改动它不会影响内部数据
+ */
 export function listExpenses(filter?: ExpenseFilter): Expense[] {
   let list = [...db.expenses]
   if (filter?.start) list = list.filter((e) => e.date >= filter.start!)

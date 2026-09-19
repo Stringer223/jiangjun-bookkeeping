@@ -36,6 +36,9 @@ async function load(): Promise<void> {
     if (month.value) {
       const m = formatMonth(month.value)
       filter.start = `${m}-01`
+      // 月末固定用 -31：date 是 'YYYY-MM-DD' 字符串，筛选走字典序比较，
+      // 任何真实日期都 ≤ 'YYYY-MM-31'（不存在 -32 及以后的日期），
+      // 所以二月、小月也无需按实际天数计算
       filter.end = `${m}-31`
     }
     if (categoryId.value) filter.categoryId = categoryId.value
@@ -111,6 +114,9 @@ function openEdit(row: Expense): void {
   editingId.value = row.id
   editAmount.value = row.amountCents / 100
   editCategory.value = row.categoryId
+  // 补 T00:00:00 是在告诉 JS 按【本地时间】解析。
+  // 直接 new Date('2026-09-15') 会按 UTC 解析，东八区下变成前一天 08:00，
+  // 回填到日期选择器整整差一天
   editDate.value = new Date(`${row.date}T00:00:00`).getTime()
   editNote.value = row.note ?? ''
   editOpen.value = true
@@ -147,6 +153,8 @@ async function remove(row: Expense): Promise<void> {
 
 async function exportCsv(): Promise<void> {
   const data = await window.api.listExpenses({})
+  // CSV 转义：字段内的半角逗号会被换成全角「，」，以保证列数不错位。
+  // 注意这是有损转换 —— 导出文件里的备注会和 App 内显示的不完全一样
   const escape = (s: string): string => s.replace(/,/g, '，').replace(/"/g, '""')
   const header = '日期,分类,金额(元),备注'
   const lines = data.map((e) => {

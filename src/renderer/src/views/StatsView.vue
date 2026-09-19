@@ -30,6 +30,8 @@ const categoryBars = computed<CatBar[]>(() => {
   const map = new Map<string, number>()
   for (const e of monthExpenses.value) {
     const top = findTopCategory(categories.value, e.categoryId)
+    // 分类被删掉后历史账目仍引用旧 id，findTopCategory 返回 undefined，
+    // 统一兜底成「未分类」（与 utils.ts 的 findCategoryPath 同一套路）
     const name = top?.name ?? '未分类'
     map.set(name, (map.get(name) ?? 0) + e.amountCents)
   }

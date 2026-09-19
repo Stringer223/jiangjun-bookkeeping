@@ -38,7 +38,12 @@ export function toCascaderOptions(
   }))
 }
 
-/** 根据二级小类 id，返回「一级 / 二级」展示路径 */
+/**
+ * 按分类 id 取展示路径：传二级 id 得「一级 / 二级」，传一级 id 得一级名。
+ *
+ * 找不到时返回「未分类」而不是抛错 —— 分类被删掉后，历史账目仍引用着旧 id，
+ * 这条路径会真实走到，抛错会让整张账单渲染不出来。
+ */
 export function findCategoryPath(categories: Category[], id: string): string {
   for (const c of categories) {
     if (c.id === id) return c.name
@@ -48,7 +53,11 @@ export function findCategoryPath(categories: Category[], id: string): string {
   return '未分类'
 }
 
-/** 根据二级小类 id，返回所属的一级大类 */
+/**
+ * 按分类 id 找它所属的一级大类：传一级 id 返回自身，传二级 id 返回其父级。
+ *
+ * 找不到返回 undefined，由调用方决定怎么兜底（界面上一律显示「未分类」）。
+ */
 export function findTopCategory(categories: Category[], id: string): Category | undefined {
   for (const c of categories) {
     if (c.id === id) return c

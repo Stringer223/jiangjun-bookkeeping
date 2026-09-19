@@ -29,6 +29,8 @@ function createWindow(): void {
     title: '将军记账',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
+      // 关沙箱是为了让 preload 能用 Node 能力（下方 contextIsolation 仍开着，
+      // 渲染进程本身拿不到 Node）。若将来 preload 不再需要 Node 能力，应改回 true
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false

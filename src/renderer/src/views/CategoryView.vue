@@ -20,6 +20,8 @@ onMounted(async () => {
 })
 
 async function persist(): Promise<void> {
+  // 必须先做一次 JSON 往返：categories.value 是 Vue 响应式 Proxy，
+  // 而 Proxy 无法通过 IPC 的结构化克隆，直接传会抛错。这不是冗余代码，别删
   categories.value = await window.api.setCategories(JSON.parse(JSON.stringify(categories.value)))
 }
 
@@ -37,6 +39,8 @@ function openRenameChild(cat: Category, child: Category): void {
 }
 
 function onChildClick(cat: Category, child: Category): void {
+  // 预置分类锁定，点击不做任何事（页面顶部已写明「预置分类已锁定」）。
+  // 这里静默返回是有意的，不是漏了提示
   if (child.isPreset) return
   openRenameChild(cat, child)
 }

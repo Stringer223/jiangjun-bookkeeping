@@ -2,6 +2,8 @@ import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { promises as fs } from 'fs'
 import {
+  pinDataLocation,
+  migrateLegacyData,
   load,
   getCategories,
   setCategories,
@@ -12,6 +14,9 @@ import {
   deleteExpense
 } from './store'
 import type { Category, Expense, ExpenseFilter } from '../shared/types'
+
+// 必须在 app ready 之前执行，否则 Electron 已经按默认目录初始化过了
+pinDataLocation()
 
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
@@ -45,6 +50,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  await migrateLegacyData()
   await load()
 
   ipcMain.handle('categories:get', () => getCategories())

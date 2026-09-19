@@ -3,3 +3,6 @@ dist
 out
 *.log
 .DS_Store
+
+# AI 工具的工作目录，不是项目代码
+.workbuddy/

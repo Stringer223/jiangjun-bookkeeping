@@ -76,7 +76,9 @@
 
 ## 5. 数据存储（当前实现：本地 JSON 文件）
 
-- 当前实现：**本地 JSON 文件**，存放于 `app.getPath('userData')/data.json`（Windows 上位于 `%APPDATA%` 下应用目录内）。
+- 当前实现：**本地 JSON 文件**，固定存放于 `%APPDATA%\将军记账\data.json`。
+- **目录名是钉死的，不要改成跟随 `app.getName()`**：`src/main/store.ts` 的 `pinDataLocation()` 在 app ready 之前调用 `app.setPath('userData', ...)`。若不钉死，打包后读 productName「将军记账」、开发模式读 package.json 的 name「jiangjun-bookkeeping」，两种运行方式会各写一份 `data.json`，换个方式打开 App 就会看到空账本，像是账目丢了（这个坑真实发生过）。
+- 旧目录 `%APPDATA%\jiangjun-bookkeeping` 是历史遗留。`migrateLegacyData()` 会在新目录没有数据时把旧数据复制过去（只复制不删除，旧文件留作兜底），在 `load()` 之前调用。
 - 选型理由：本机缺 VS C++ 构建工具，SQLite 原生绑定（better-sqlite3）需编译；纯 JS 版（sql.js）打包时 wasm 路径处理繁琐。个人记账数据量（即使十年也就几万条）JSON 完全够用，零依赖、最稳。
 - 预留升级：数据层已集中在 `src/main/store.ts`，日后若需 SQLite（大数据量 / 复杂查询），仅替换该文件即可。
 

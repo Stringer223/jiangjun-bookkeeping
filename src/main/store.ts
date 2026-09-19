@@ -49,6 +49,48 @@ interface Db {
 
 let db: Db = { categories: [], expenses: [] }
 
+/** 数据目录名。写死在这里，不让它跟着 app.getName() 走。 */
+const DATA_DIR_NAME = '将军记账'
+
+/** 早期开发模式沿用的目录名（当时 userData 跟随 package.json 的 name） */
+const LEGACY_DIR_NAME = 'jiangjun-bookkeeping'
+
+/**
+ * 钉死数据目录，必须在 app ready 之前调用。
+ *
+ * 不钉死的话，userData 会跟着 app.getName() 走：打包后是 productName「将军记账」，
+ * 开发模式是 package.json 的 name「jiangjun-bookkeeping」。两种运行方式各存一份
+ * data.json，换个方式打开 App 就会看到空账本，像是账目丢了。
+ */
+export function pinDataLocation(): void {
+  app.setPath('userData', join(app.getPath('appData'), DATA_DIR_NAME))
+}
+
+/**
+ * 把早期留在旧目录里的账目搬到新目录，在 load() 之前调用。
+ *
+ * 只在「新目录还没有数据」且「旧目录有数据」时复制一份；只复制不删除，
+ * 旧文件始终留作兜底 —— 迁移逻辑万一出错，账目也还能手工捞回来。
+ */
+export async function migrateLegacyData(): Promise<void> {
+  const legacyPath = join(app.getPath('appData'), LEGACY_DIR_NAME, 'data.json')
+
+  if (await exists(dataPath())) return
+  if (!(await exists(legacyPath))) return
+
+  await fs.mkdir(app.getPath('userData'), { recursive: true })
+  await fs.copyFile(legacyPath, dataPath())
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await fs.access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function dataPath(): string {
   return join(app.getPath('userData'), 'data.json')
 }

@@ -673,6 +673,24 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
             "否则「通过与否」就完全由 agent 自报了。"
         )
 
+    # findings 里混入非对象（比如 agent 把一行文字直接塞进数组）必须**显式拒绝**。
+    # 后面几处都要按字段取值，遇到字符串会抛 AttributeError，被 main() 归成
+    # 退出码 2「脚本自己出错」——而按本脚本的设计，2 的含义是「该我修脚本」，
+    # 那会把排查方向从这份 json 引到 gate.py 上。实测踩过。
+    #
+    # **不能改成「跳过非对象」**：跳过等于把一条可能是真问题的条目悄悄丢掉，
+    # 然后给出「通过」—— 那比报错严重得多。宁可拒绝。
+    malformed = [i for i, f in enumerate(findings) if not isinstance(f, dict)]
+    if malformed:
+        shown = ", ".join(str(i) for i in malformed[:5])
+        more = f"，另有 {len(malformed) - 5} 项" if len(malformed) > 5 else ""
+        return reject(
+            f"quality.json 的 findings 里有 {len(malformed)} 项不是对象（下标 {shown}{more}）。\n"
+            "  每一条发现都必须是带 file / line / level / confidence / title 的对象，"
+            "不能直接写成字符串或数字。\n"
+            "  请让 quality-engineer 重新产出。"
+        )
+
     # 门禁自己重算，不信 agent 填的 counts / confirmed
     by_level = histogram(findings, "level")
     confirmed_findings = [f for f in findings if str(f.get("confidence", "")).lower() == "confirmed"]

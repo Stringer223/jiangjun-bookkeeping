@@ -20,3 +20,8 @@ data.json.*
 # Claude Code 的机器本地状态。.claude/ 本身要进版本库（gitcommit-agent 是
 # 有意提交的），但这个文件是每台机器各一份的本地覆盖，不该共享
 .claude/settings.local.json
+
+# Python 字节码缓存。门禁的判官脚本是 .py，只要有人 import 它（跑测试、排查问题）
+# 就会生成这个目录；不挡的话 git add -A 会把 .pyc 扫进提交
+__pycache__/
+*.pyc

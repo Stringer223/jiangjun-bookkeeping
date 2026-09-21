@@ -115,3 +115,72 @@
 > 项目结构：`src/main`（主进程 + 数据存储 + IPC）、`src/preload`（contextBridge 桥接）、`src/renderer`（Vue 3 + Naive UI 界面）、`src/shared`（共享类型）。
 
 > **打包注意事项（本机环境）**：本机访问 GitHub 被墙，打包需设镜像 `ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/`；本机未开 Windows「开发者模式」、无符号链接权限，故 `electron-builder.yml` 已设 `signAndEditExecutable: false`（跳过 exe 图标/版本写入，当前使用默认 Electron 图标）。若需自定义图标：先开启开发者模式（或管理员运行打包），再移除该开关并配置 `win.icon`。
+
+## 8. 提交门禁（commit gate）
+
+**本仓库的提交被一道闸门拦着。** `git commit` 只有在「单元测试 + 类型检查 + 质量检查」三项全过、
+并由 `tools/commit-gate/gate.py` 签发通行证之后才放行。目的是**防遗忘、防走捷径、防自动流程漏跑**——
+不是防蓄意攻击（通行证是普通文本文件，谁都能伪造；HMAC 签名刻意不做，那会把纯 shell 钩子变成必须调 Python）。
+
+### 怎么提交
+
+**走 `gitcommit-agent`。** 它会：审视提交清单 → `git add -A` → `gate.py begin` →
+在一条消息里并行派 `tester` 与 `quality-engineer` → `gate.py check` → 写提交信息 → `git commit` →
+走 `git-save` 推送 → 独立确认推送结果 → `gate.py revoke`。
+
+手动敲 `git commit` 会被拦下，**这是预期行为**，不是出故障。
+
+### 克隆之后必须做一次
+
+`core.hooksPath` 存在 `.git/config` 里，**不受版本控制**，所以每次 clone 之后都要重跑：
+
+```bash
+git config core.hooksPath .githooks      # 仓库级，绝不要 --global
+```
+
+忘了跑的话 `git commit` 会畅通无阻——**门禁静默失效**。查当前状态：`git config --get core.hooksPath`。
+
+### 出问题时怎么合法绕过
+
+**不要用 `--no-verify`**（Claude 层专门拦它，而且它会连合并/变基的豁免一起跳过，把仓库搞乱）。正确做法：
+
+```bash
+git config --unset core.hooksPath                    # 关掉 git 层
+```
+
+Claude 层还要从 `~/.claude/settings.json` 的 `hooks` 里去掉那一项（改完立即生效，不用重启）。
+**绕过之后记得恢复**，恢复后重跑一轮 `gitcommit-agent` 把漏掉的检查补上。
+
+### 有意留出的缺口（别以为它全覆盖了）
+
+- **合并 / 变基 / 拣选的收尾提交不受门禁覆盖。** 钩子必须放行这些操作，否则连冲突都收不了尾（已实测）。
+- **`--no-verify` 能跳过整个 git 层**，只有 Claude 层拦得住，而 Claude 层只在 Claude Code 里生效——
+  在外部终端敲 `git commit --no-verify`，谁也拦不住。
+- **`tester` 的「植入 bug 验证」这类瞬时改动，门禁在原理上看不见**（前后指纹比对只取两个端点，
+  「改了又还回去」两端都是干净的）。这是本设计里**唯一依赖 agent 自律**的地方。
+- **`git commit -- <路径>` 会走临时索引**，通常导致指纹不匹配而被拒。这是 fail closed，属于可接受的代价。
+- **提交后想 `git commit --amend` 改提交信息会被拒**（提交一发生 HEAD 就前移，通行证是一次性的）。
+  需要重跑一轮。
+
+### 改门禁时必须一起改的文件
+
+`~/.claude/agents/tester.md` 与 `~/.claude/agents/quality-engineer.md` 里各有一节**「门禁模式」**，
+写明它们要产出哪些标记文件、字段叫什么、以及为什么不能用 `Out-File` 写 JSON（PowerShell 5.1 会写 BOM）。
+这三份文档（加上 `.claude/agents/gitcommit-agent.md`）与 `gate.py` 里的字段名是**硬耦合**的，
+改一处不改另一处会静默对不上——门禁会拒，但拒绝理由看着像 agent 没干活。
+
+### 一个可用性限制：门禁只支持全量提交
+
+`gate.py begin` 要求「工作区 == 暂存区」且**没有未跟踪文件**，所以它天然只支持**把当前所有改动一起提交**。
+想只提交一部分、把其余留在工作区（比如「先提交门禁基建，app 侧继续改」），得先把不想提交的路径
+写进 `.git/info/exclude`（**本地忽略，不进版本库**）：
+
+```bash
+echo "/tools/" >> .git/info/exclude     # 临时藏起来，用完记得删掉这几行
+```
+
+这条限制是有代价的，但它换来的是「**测过的内容 == 提交的内容**」不再依赖人的自觉：
+只看指纹的比对，在工作区存在未暂存改动时是**看不见问题**的（索引的 tree 没变，而测试跑的是工作区里的新代码）。
+如果哪天觉得这道限制太碍事，正确的做法是重新设计这一环（比如让 `gate.py` 自己 stash 未暂存改动），
+**而不是放宽 `begin` 的那条断言**——那条断言正是这套东西赖以成立的地方。
+

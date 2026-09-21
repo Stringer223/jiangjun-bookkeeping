@@ -16,3 +16,7 @@ out
 # 这里兜底：调试时若把 userData 指到项目里，也不会把账本或留证文件误提交
 data.json
 data.json.*
+
+# Claude Code 的机器本地状态。.claude/ 本身要进版本库（gitcommit-agent 是
+# 有意提交的），但这个文件是每台机器各一份的本地覆盖，不该共享
+.claude/settings.local.json

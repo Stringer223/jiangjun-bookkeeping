@@ -1,0 +1,108 @@
+#!/bin/sh
+# 提交门禁闸门。只做一件事：确认「有一张对得上当前内容的通行证」。
+# 不做判定、不跑测试、不解析 JSON —— 那些是 gate.py 的活。
+#
+# 本文件必须以 LF 结尾（见 .gitattributes）。CRLF 会让 sh 报
+# "\r: command not found"，表现为「所有提交都被拒且报错完全看不懂」。
+# 实测本机（Git for Windows 的 MSYS sh）**容忍 CRLF、钩子照跑**，
+# 但这条规则仍然要加 —— 跨机器/跨工具一致，成本只有一行。
+#
+# 只用 shell 内建 + git，不用 cat/sed/tr/dirname —— 把外部命令依赖降到 0。
+# 只用相对路径（git 保证 hook 的 cwd 是工作树根目录），这样也不会撞上
+# 中文路径的编码问题。
+
+# 不受管的仓库直接放行。防止将来有人设了全局 core.hooksPath 误伤别的仓库。
+[ -f tools/commit-gate/gate.py ] || exit 0
+
+# 拒绝时统一走这里：理由同时写 stderr（git 会转给用户看）**和** reject.log。
+#
+# 为什么要落一份日志：跑流程的是子代理，它经常看不到 stderr，只拿到一句
+# 「commit 失败」。把完整理由也写进 reject.log，排查时才有东西可看。
+#
+# $1 是给日志用的事件标识（英文短词，便于 grep）；理由放在 $REASON 里。
+reject() {
+  printf '%s\n' "$REASON" >&2
+  # 只在目录存在时写。否则重定向失败会让 sh 吐出一句与门禁毫无关系的报错
+  # （"No such file or directory"），把人带到错误的方向。
+  [ -d .workbuddy/commit-gate ] && printf '%s %s\n%s\n' "$(date)" "$1" "$REASON" >> .workbuddy/commit-gate/reject.log 2>/dev/null
+  exit 1
+}
+
+# merge / rebase / cherry-pick 收尾阶段放行：这些操作有自己的流程，
+# 而 hook 层无法区分「收尾用的提交」和「新提交」。
+# 代价：这类提交不受门禁覆盖（有意留出的缺口，见 CLAUDE.md）。
+# 这一组豁免是**必须**的而不是保险：没有它连冲突合并都收不了尾（已实测）。
+for m in .git/MERGE_HEAD .git/CHERRY_PICK_HEAD .git/REVERT_HEAD .git/sequencer; do
+  [ -e "$m" ] && { printf '%s\n' "commit-gate: 处于 $m 中途，跳过门禁检查" >&2; exit 0; }
+done
+for d in .git/rebase-merge .git/rebase-apply; do
+  [ -d "$d" ] && { printf '%s\n' "commit-gate: 处于变基中途，跳过门禁检查" >&2; exit 0; }
+done
+
+ticket=.workbuddy/commit-gate/run/PASS.tree
+
+if [ ! -f "$ticket" ]; then
+  REASON="commit-gate: 没有通行证，提交被拒绝。
+  请走 gitcommit-agent 流程（单元测试 + 类型检查 + 质量检查），再提交。
+  通行证应在：$ticket"
+  reject no-ticket
+fi
+
+# 只取前 40 个十六进制字符：同时吃掉 CR（万一通行证被写成了 CRLF）
+# 和可能的尾随空白。printf 是 shell 内建，不引入外部命令依赖。
+IFS= read -r want < "$ticket" || want=
+want=$(printf '%.40s' "$want")
+
+now=$(git write-tree) || {
+  REASON="commit-gate: git write-tree 失败（索引里是否还有未解决的冲突？）
+  请先用 \`git status\` 看看仓库状态。"
+  reject write-tree-failed
+}
+now=$(printf '%.40s' "$now")
+
+if [ "$want" != "$now" ]; then
+  REASON="commit-gate: 拒绝 —— 通行证与当前索引的 tree 不匹配。
+  通行证：$want
+  当前索引：$now
+  原因：检查之后又改过代码，或者这一轮根本没跑检查。
+  请重新走一轮 gitcommit-agent（先 git add -A，再 begin → 检查 → check）。
+  不要用 --no-verify 绕过。"
+  reject tree-mismatch
+fi
+
+# 第二道：HEAD 绑定。通行证是一次性的 —— 签发时记下当时的 HEAD，
+# 提交一发生 HEAD 就前移，这张通行证自动失效。
+#
+# 为什么必须有这一道：撤销通行证的动作只在 gitcommit-agent 里，
+# 手动提交（直接 /git-save，或在外部终端敲 git commit）时没人清它。
+# 没有这一道，同一张通行证就能被用第二次 —— 比如提交完再 amend 改提交信息，
+# tree 一个字都没变，上面那道 tree 比对完全看不出来。
+#
+# 仓库还没有任何提交时（unborn HEAD），git rev-parse HEAD 会失败，now_head 取空串；
+# 而 gate.py 的 head_sha 同样返回空串、PASS.head 里就是单独一个空行，
+# 两边都是空串 → 判为相等、放行。这是对的：首次提交本来就该放行。（已实测）
+headticket=.workbuddy/commit-gate/run/PASS.head
+
+if [ ! -f "$headticket" ]; then
+  REASON="commit-gate: 拒绝 —— 通行证缺少 HEAD 绑定信息。
+  这张通行证是旧版 gate.py 签发的，无法确认它有没有被用掉。
+  请重跑一轮 gitcommit-agent。"
+  reject no-pass-head
+fi
+
+IFS= read -r want_head < "$headticket" || want_head=
+want_head=$(printf '%.40s' "$want_head")
+
+now_head=$(git rev-parse HEAD 2>/dev/null) || now_head=
+now_head=$(printf '%.40s' "$now_head")
+
+if [ "$want_head" != "$now_head" ]; then
+  REASON="commit-gate: 拒绝 —— 这张通行证不是针对当前 HEAD 签发的。
+  通行证签发时的 HEAD：$want_head
+  当前 HEAD：          $now_head
+  原因：通行证已经被用掉一次（提交过一回了），HEAD 已经前移。
+  一张通行证只对应一次提交，请重跑一轮 gitcommit-agent。"
+  reject head-mismatch
+fi
+
+exit 0

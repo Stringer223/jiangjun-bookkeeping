@@ -1,0 +1,5 @@
+# 门禁 hook 由 git 自带的 sh 执行，行尾必须是 LF。
+# 本仓库 core.autocrlf=true，不加这条的话 hook 会被 checkout 成 CRLF。
+# 注意：实测本机 MSYS sh 容忍 CRLF（钩子仍能跑），加这条是为了跨机器/跨工具一致，
+# 不要按「不加就崩」来理解。
+.githooks/* text eol=lf

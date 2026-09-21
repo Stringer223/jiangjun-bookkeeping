@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises'
+import { access, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'fs/promises'
+// 和 store.ts 用同一个导入写法拿 promises 对象，vi.spyOn 才能改到 store 真正调用的那个方法
+import { promises as fs } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { Expense } from '../shared/types'
@@ -44,6 +46,25 @@ async function seedExpenses(rows: Array<Partial<Expense> & { date: string }>): P
     createdAt: r.createdAt ?? 1000 + i
   }))
   await seedFile(JSON.stringify({ categories: store.buildDefaultCategories(), expenses }))
+  await store.load()
+}
+
+/** 按前缀找目录里的文件：corrupt / rejected 的后缀是时间戳，没法预先写死全名 */
+async function findFilesByPrefix(prefix: string): Promise<string[]> {
+  const names = await readdir(dataDir())
+  return names.filter((n) => n.startsWith(prefix))
+}
+
+/**
+ * 往 expenses 里塞一条「原始 JSON 文本」写的记录。
+ *
+ * 不能借 JSON.stringify：它会把 NaN / Infinity 变成 null，想造出「解析后是非有限数」
+ * 的 1e999（JSON.parse('1e999') === Infinity）就只能手写文本。
+ */
+async function seedRawElement(element: string): Promise<void> {
+  await seedFile(
+    `{"categories":${JSON.stringify(store.buildDefaultCategories())},"expenses":[${element}]}`
+  )
   await store.load()
 }
 
@@ -143,6 +164,25 @@ describe('记账增删改', () => {
     const e = await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
     await store.updateExpense({ ...e, amountCents: 999 })
     expect(store.listExpenses()[0].amountCents).toBe(999)
+  })
+
+  it('修改记录时 createdAt 沿用原值，传入的非法值不会落盘', async () => {
+    // 故意传一个非数字的 createdAt：IPC 层的 assertExpenseInput 不校验这个字段，
+    // 而读盘的 isExpense 要求它是有限数字、否则整条记录被丢弃。
+    // 修改是**整条替换**，所以这里若照单全收，就会落一条「本次保存成功、
+    // 下次启动凭空消失」的记录 —— 而项目纪律是「丢启动可以，丢数据不行」。
+    const e = await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    const saved = await store.updateExpense({
+      ...e,
+      amountCents: 999,
+      createdAt: 'oops' as unknown as number
+    })
+
+    expect(saved.createdAt).toBe(e.createdAt)
+    expect(store.listExpenses()[0].createdAt).toBe(e.createdAt)
+    // 落盘的也得是原值 —— 只对内存里负责不够，重启读的是文件
+    const raw = JSON.parse(await readFile(dataFile(), 'utf-8'))
+    expect(raw.expenses[0].createdAt).toBe(e.createdAt)
   })
 
   it('删除后列表里就没有了', async () => {
@@ -370,5 +410,259 @@ describe('migrateLegacyData 旧目录迁移', () => {
     await expect(store.migrateLegacyData()).resolves.toBeUndefined()
     await expect(access(legacyDir())).rejects.toThrow()
     await expect(access(dataFile())).rejects.toThrow()
+  })
+})
+
+describe('load 首次启动（ENOENT 分支）', () => {
+  it('新目录里只写出 data.json，不留 tmp / corrupt / rejected 残渣', async () => {
+    // beforeEach 已经在全新目录里跑过一次 load，走的正是 ENOENT 分支。
+    // 这里盯的是「补偿逻辑别越界」：rename 留证、写 rejected 文件都只该在
+    // 内容损坏 / 有脏记录时发生；一旦被挪进 ENOENT 分支，文件根本不存在，
+    // rename 会抛 ENOENT —— 用户第一次启动就直接失败
+    expect(await readdir(dataDir())).toEqual(['data.json'])
+  })
+})
+
+describe('load 内容损坏（JSON 解析失败）', () => {
+  it('把坏文件改名留证，且留证内容与原文件一致（不是留个空壳）', async () => {
+    // 直接覆盖写等于抹掉用户唯一的一份账目，之后连手工捞回来的机会都没有。
+    // 所以光「回落到默认分类」不算过关，必须先留一份真的能读回来的证据
+    const broken = '{ 这不是合法的 JSON'
+    await seedFile(broken)
+    await store.load()
+
+    const backups = await findFilesByPrefix('data.json.corrupt-')
+    expect(backups).toHaveLength(1)
+    expect(await readFile(join(dataDir(), backups[0]), 'utf-8')).toBe(broken)
+  })
+
+  it('留证之后再回落默认分类并落盘，启动仍然可用', async () => {
+    await seedFile('{ 这不是合法的 JSON')
+    await store.load()
+    expect(store.getCategories()).toHaveLength(9)
+    // 新文件必须真的写出来，否则下次启动又会再走一遍损坏分支
+    expect(JSON.parse(await readFile(dataFile(), 'utf-8')).categories).toHaveLength(9)
+  })
+})
+
+describe('load 遇到非 ENOENT 的读错误', () => {
+  it('一个字节都不写盘（不能把「读不出来」当成「首次启动」）', async () => {
+    // 用真实 fs 造错、不 mock：把 data.json 换成同名目录，readFile 会抛 EISDIR。
+    // 旧实现把所有异常都当首次启动，于是这条路径会当场用一份空账本覆盖掉用户的
+    // 数据文件 —— 而这种覆盖是不可恢复的
+    await rm(dataFile(), { force: true })
+    await mkdir(dataFile())
+
+    await expect(store.load()).rejects.toThrow()
+
+    // 判别依据是「没写盘」这一组：目标位置还是那个目录，没被写成文件、没被删掉，
+    // 也没有留下 tmp / corrupt 残渣。
+    // 注意不能只断言 rejects —— 被吞掉错误之后，persist() 自己也会因为
+    // rename 到目录上而失败再抛出来，"抛了错"这件事本身区分不出对错
+    expect((await stat(dataFile())).isDirectory()).toBe(true)
+    expect(await readdir(dataDir())).toEqual(['data.json'])
+  })
+
+  it('抛出的是原先那个读错误本身，而不是包装过或换成别的错误', async () => {
+    // index.ts 靠这个错误决定弹什么提示、并停止启动；错误被替换掉就会误导排查
+    await rm(dataFile(), { force: true })
+    await mkdir(dataFile())
+
+    await expect(store.load()).rejects.toMatchObject({ code: 'EISDIR' })
+  })
+})
+
+describe('load 逐条校验账目记录（isExpense）', () => {
+  /** 一条完整合法记录，作为对照组 */
+  const GOOD =
+    '"id":"e1","amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1'
+  const rec = (fields: string): string => `{${fields}}`
+
+  it('合法记录被保留（对照组）', async () => {
+    await seedRawElement(rec(GOOD))
+    expect(store.listExpenses().map((e) => e.id)).toEqual(['e1'])
+  })
+
+  it('note 缺字段时保留，它是可选字段而不是必填', async () => {
+    // 把 note 也纳入必填会让所有「没写备注」的历史账目被当成脏数据丢掉
+    await seedRawElement(rec(GOOD))
+    expect(store.listExpenses()[0].note).toBeUndefined()
+  })
+
+  const BAD_RECORDS: Array<[string, string]> = [
+    ['id 缺字段', rec('"amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['id 是空串', rec('"id":"","amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['amountCents 缺字段', rec('"id":"e1","categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['amountCents 是字符串', rec('"id":"e1","amountCents":"100","categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['amountCents 是 null（NaN/Infinity 被 stringify 后的样子）', rec('"id":"e1","amountCents":null,"categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['amountCents 溢出成 Infinity', rec('"id":"e1","amountCents":1e999,"categoryId":"c1-1","date":"2026-09-15","createdAt":1')],
+    ['categoryId 缺字段', rec('"id":"e1","amountCents":100,"date":"2026-09-15","createdAt":1')],
+    ['date 不是 YYYY-MM-DD（"今天"）', rec('"id":"e1","amountCents":100,"categoryId":"c1-1","date":"今天","createdAt":1')],
+    ['date 月日没补零', rec('"id":"e1","amountCents":100,"categoryId":"c1-1","date":"2026-9-5","createdAt":1')],
+    ['createdAt 是字符串', rec('"id":"e1","amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":"1"')],
+    ['createdAt 溢出成 Infinity', rec('"id":"e1","amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1e999')],
+    ['note 不是字符串', rec('"id":"e1","amountCents":100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1,"note":123')]
+  ]
+
+  // 一条坏记录足以让整张账单显示 ¥ NaN 并把排序打乱，所以逐条钉死
+  for (const [label, element] of BAD_RECORDS) {
+    it(`丢弃脏记录：${label}`, async () => {
+      await seedRawElement(element)
+      expect(store.listExpenses()).toEqual([])
+    })
+  }
+
+  it('丢弃脏记录：元素是 null', async () => {
+    await seedRawElement('null')
+    expect(store.listExpenses()).toEqual([])
+  })
+
+  it('丢弃脏记录：元素是字符串', async () => {
+    await seedRawElement('"不是对象"')
+    expect(store.listExpenses()).toEqual([])
+  })
+
+  it('被丢弃的记录会写进 rejected 文件留证，内容就是被丢掉的那条', async () => {
+    // 不留证的话用户只看到账目莫名变少，也没法手工把数据捞回来
+    const dirty = '{"id":"e-bad"}'
+    await seedRawElement(rec(GOOD) + ',' + dirty)
+
+    expect(store.listExpenses().map((e) => e.id)).toEqual(['e1'])
+
+    const files = await findFilesByPrefix('data.json.rejected')
+    expect(files).toHaveLength(1)
+    expect(JSON.parse(await readFile(join(dataDir(), files[0]), 'utf-8'))).toEqual(
+      JSON.parse(`[${dirty}]`)
+    )
+  })
+
+  it('记录全都合法时不产生 rejected 文件，免得天天误报「有数据被丢」', async () => {
+    await seedExpenses([{ date: '2026-09-15' }, { date: '2026-09-16' }])
+    expect(await findFilesByPrefix('data.json.rejected')).toEqual([])
+  })
+
+  it('反复启动不会累积 rejected 文件（同一批脏记录只留一份证据）', async () => {
+    // load() 刻意不写回 data.json，所以脏记录会一直留在原文件里、每次启动都被重新过滤一遍。
+    // 如果留证文件名带时间戳，就会每次开机复制一份内容完全相同的证据出来，无限累积 ——
+    // 这条钉住的是「文件名必须稳定」，去掉时间戳之后才成立
+    const dirty = '{"id":"e-bad"}'
+    await seedRawElement(rec(GOOD) + ',' + dirty)
+
+    await store.load()
+    await store.load()
+    await store.load()
+
+    const files = await findFilesByPrefix('data.json.rejected')
+    expect(files).toHaveLength(1)
+    // 内容也要是那份没变的证据，而不是被后一次加载覆盖成别的东西
+    expect(JSON.parse(await readFile(join(dataDir(), files[0]), 'utf-8'))).toEqual(
+      JSON.parse(`[${dirty}]`)
+    )
+  })
+
+  it('金额为 0 / 负数 / 浮点的记录会被丢弃（App 自己造不出这三种）', async () => {
+    // 收紧 isExpense 口径后才成立：旧的 Number.isFinite 会放行它们，
+    // 显示出来就是 ¥ 0.00 / ¥ -12.00 / ¥ 12.34 这类不该出现的账目
+    await seedRawElement(
+      [
+        rec('"id":"zero","amountCents":0,"categoryId":"c1-1","date":"2026-09-15","createdAt":1'),
+        rec('"id":"neg","amountCents":-100,"categoryId":"c1-1","date":"2026-09-15","createdAt":1'),
+        rec('"id":"float","amountCents":12.34,"categoryId":"c1-1","date":"2026-09-15","createdAt":1')
+      ].join(',')
+    )
+    expect(store.listExpenses()).toEqual([])
+  })
+
+  it('categoryId 为空串的记录会被丢弃', async () => {
+    // 空串会让账目落进「引用了一个不存在的分类」的状态，界面显示成「未分类」，
+    // 用户以为分类丢了却查不出原因
+    await seedRawElement(
+      rec('"id":"e1","amountCents":100,"categoryId":"","date":"2026-09-15","createdAt":1')
+    )
+    expect(store.listExpenses()).toEqual([])
+  })
+})
+
+describe('原子写（persist）', () => {
+  it('写盘结束后目录里不残留 data.json.tmp', async () => {
+    // tmp 是写盘的中间产物，残留说明 rename 那一步没走到，
+    // 目录里会多出一个可能被误当成数据文件的半成品
+    await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    expect(await findFilesByPrefix('data.json.tmp')).toEqual([])
+    expect(await readdir(dataDir())).toEqual(['data.json'])
+  })
+
+  it('写盘后 data.json 是完整可解析的 JSON，内容与内存里那份一致', async () => {
+    const e = await store.addExpense({ amountCents: 3550, categoryId: 'c1-1', date: '2026-09-15' })
+    expect(JSON.parse(await readFile(dataFile(), 'utf-8')).expenses).toEqual([e])
+  })
+})
+
+describe('落盘失败时回滚内存', () => {
+  /** 让 persist() 的最后一步 rename 失败，模拟磁盘满 / 权限不足 / 文件被占用 */
+  function breakPersist(): void {
+    vi.spyOn(fs, 'rename').mockRejectedValue(new Error('磁盘已满'))
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('新增失败后这条记录不留在内存里', async () => {
+    // 不回滚的话界面显示「已记一笔」但磁盘上什么都没有，重启后记录消失 ——
+    // 用户以为自己记过账，实际什么都没留下
+    const kept = await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    breakPersist()
+
+    await expect(
+      store.addExpense({ amountCents: 200, categoryId: 'c1-1', date: '2026-09-16' })
+    ).rejects.toThrow('磁盘已满')
+
+    expect(store.listExpenses().map((e) => e.id)).toEqual([kept.id])
+  })
+
+  it('修改失败后原值还在，不会被改后的值污染', async () => {
+    const e = await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    breakPersist()
+
+    await expect(store.updateExpense({ ...e, amountCents: 999 })).rejects.toThrow('磁盘已满')
+
+    expect(store.listExpenses()[0].amountCents).toBe(100)
+  })
+
+  it('删除失败后记录还在', async () => {
+    const e = await store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    breakPersist()
+
+    await expect(store.deleteExpense(e.id)).rejects.toThrow('磁盘已满')
+
+    expect(store.listExpenses().map((x) => x.id)).toEqual([e.id])
+  })
+
+  it('保存分类失败后分类树退回原样', async () => {
+    // setCategories 是整树覆盖保存：留在内存里的「假状态」会在下一次保存时被固化下来
+    breakPersist()
+
+    await expect(store.setCategories([{ id: 'user-1', name: '我的分类' }])).rejects.toThrow(
+      '磁盘已满'
+    )
+
+    const cats = store.getCategories()
+    expect(cats).toHaveLength(9)
+    expect(cats[0].name).toBe('餐饮食品')
+  })
+
+  it('失败一次之后再保存仍能成功，内存数组没有被改坏', async () => {
+    // addExpense 的回滚用的是 pop()，一旦将来换成按 id 删或下标删，
+    // 很容易在「失败后重试」这条路径上误伤别的记录
+    const spy = vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('磁盘已满'))
+
+    await expect(
+      store.addExpense({ amountCents: 100, categoryId: 'c1-1', date: '2026-09-15' })
+    ).rejects.toThrow('磁盘已满')
+    expect(spy).toHaveBeenCalledTimes(1)
+
+    const ok = await store.addExpense({ amountCents: 200, categoryId: 'c1-1', date: '2026-09-16' })
+    expect(store.listExpenses().map((e) => e.id)).toEqual([ok.id])
   })
 })

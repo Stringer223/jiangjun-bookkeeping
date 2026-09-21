@@ -126,8 +126,30 @@ describe('toCascaderOptions', () => {
     })
   })
 
-  it('没有二级小类的一级分类，children 兜底为空数组而不是崩掉', () => {
+  it('没有二级小类的一级分类要「省略」children 字段，否则在 Cascader 里根本选不中', () => {
+    // 关键区别：省略字段 vs children: []。
+    // Naive UI 底层按 `!getChildren(node)` 判叶子（treemate/es/utils.js），
+    // 而空数组是 truthy，于是这种分类会被当成父节点 —— 点它只会展开一个空的
+    // 二级面板，永远无法选中，用户新建了一级大类却没法用它记账。
+    // 旧断言写的是 toEqual([])，等于把这个 bug 钉死在测试里。
     const opts = toCascaderOptions([{ id: 'c9', name: '其他', isPreset: true }])
-    expect(opts[0].children).toEqual([])
+    expect(opts[0].children).toBeUndefined()
+  })
+
+  it('没有二级小类时「children 这个键都不存在」，序列化结果里也搜不到', () => {
+    // 比 toBeUndefined 更严：{ children: undefined } 也能让 toBeUndefined 通过，
+    // 但字段存在本身在合并 / 序列化 / 展开赋值时仍可能变回 []，
+    // 于是又被 Naive UI 当成父节点。用 in 确认键确实没被定义出来
+    const opt = toCascaderOptions([{ id: 'c9', name: '其他', isPreset: true }])[0]
+    expect('children' in opt).toBe(false)
+    expect(JSON.stringify(opt)).toBe('{"label":"其他","value":"c9"}')
+  })
+
+  it('children 是空数组（新建大类还没加小类）时，同样要省略该字段', () => {
+    // 这条和「字段缺失」不是同一条路径：新建一级大类后 store 里存的就是 children: [],
+    // 走的是 (c.children ?? []).map() 得到空数组这个分支，
+    // 而空数组是 truthy —— 稍一写成 ?? [] 之外还要判长度，就会漏掉它
+    const opt = toCascaderOptions([{ id: 'user-1', name: '我的大类', isPreset: false, children: [] }])[0]
+    expect('children' in opt).toBe(false)
   })
 })

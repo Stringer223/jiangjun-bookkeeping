@@ -15,7 +15,13 @@ const loading = ref(false)
 const cascaderOptions = computed(() => toCascaderOptions(categories.value))
 
 onMounted(async () => {
-  categories.value = await window.api.getCategories()
+  try {
+    categories.value = await window.api.getCategories()
+  } catch {
+    // 拉不到分类 → 选择框一片空白，用户会以为「没有分类可选」，于是完全没法记账。
+    // 这条失败路径必须出声，否则表现为「这个软件坏了但我不知道哪坏了」
+    message.error('分类加载失败，请重启应用后再试')
+  }
 })
 
 async function submit(): Promise<void> {

@@ -79,6 +79,15 @@
 - 当前实现：**本地 JSON 文件**，固定存放于 `%APPDATA%\将军记账\data.json`。
 - **目录名是钉死的，不要改成跟随 `app.getName()`**：`src/main/store.ts` 的 `pinDataLocation()` 在 app ready 之前调用 `app.setPath('userData', ...)`。若不钉死，打包后读 productName「将军记账」、开发模式读 package.json 的 name「jiangjun-bookkeeping」，两种运行方式会各写一份 `data.json`，换个方式打开 App 就会看到空账本，像是账目丢了（这个坑真实发生过）。
 - 旧目录 `%APPDATA%\jiangjun-bookkeeping` 是历史遗留。`migrateLegacyData()` 会在新目录没有数据时把旧数据复制过去（只复制不删除，旧文件留作兜底），在 `load()` 之前调用。
+- **读盘失败时拒绝启动，绝不回写**（2026-09-20 修正）。`load()` 按错误类型分流：只有 `ENOENT`（文件真的不存在）才当成首次启动、生成默认分类并落盘；JSON 内容损坏时先把坏文件改名成 `data.json.corrupt-<时间戳>` 留证，再回落默认分类；其余错误（`EACCES` 被杀毒/备份软件占用、磁盘满、`EIO`）**原样抛出**，由 `src/main/index.ts` 弹错误框后退出。
+  - **这条纪律不能松**：早期实现把所有异常都当「首次启动」，于是上述任何一种失败都会用一份空账本覆盖用户唯一的数据文件，且没有备份、不可恢复（`store.ts` 里原本还有一句注释预感到了这个风险，却没兜住）。
+  - 代价是启动失败时用户看到一个错误框（提示数据文件未被改动、不要反复重启），而不是一个能用的空界面。这是刻意的取舍：**丢启动可以，丢数据不行。**
+- **落盘是原子写**：`persist()` 先写 `data.json.tmp` 再 `rename`。同分区 rename 是原子的，所以 `data.json` 永远只可能是「旧的完整内容」或「新的完整内容」，不会留下写了一半的 JSON（半截 JSON 会走进上面的损坏分支，两级串起来就是丢账目）。
+- **落盘失败要回滚内存**：`setCategories` / `addExpense` / `updateExpense` / `deleteExpense` 四个写操作在 `persist()` 抛错时会把内存改回去再抛，避免「界面说已保存、重启后记录不存在」。
+- **脏记录在入口过滤**：`load()` 用 `isExpense()` 逐条校验，不合格的记录不进内存（一条 `{ id: 'e1' }` 就足以让整张账单显示 `¥ NaN` 并把排序打乱），同时把被丢弃的记录另存为 `data.json.rejected.json` 留证。
+  - 校验口径与 IPC 层的 `assertExpenseInput` **保持一致**：`id` 与 `categoryId` 非空、金额必须是**正整数**（排掉 `NaN`/`Infinity`/负数/`0`/浮点）、`date` 必须是 `YYYY-MM-DD`。两条入口都要守 —— IPC 那层挡渲染进程，`isExpense` 挡**手工改过的文件**，松紧不能不一致，否则会出现「App 造不出来但文件里能存在」的脏数据。
+- 因此数据目录下可能出现 `data.json.tmp`（正常情况瞬间消失）、`data.json.corrupt-<时间戳>`、`data.json.rejected.json`。**都是刻意留的证据文件，不是垃圾，不要随手删。**
+  - 注意 `rejected` 那个**刻意不带时间戳**：`load()` 不写回 `data.json`（读盘路径不该顺手改用户的数据），所以脏记录会一直留在原文件里、每次启动被重新过滤一遍。若用带时间戳的名字，就会每次开机复制一份内容完全相同的证据，无限累积。
 - 选型理由：本机缺 VS C++ 构建工具，SQLite 原生绑定（better-sqlite3）需编译；纯 JS 版（sql.js）打包时 wasm 路径处理繁琐。个人记账数据量（即使十年也就几万条）JSON 完全够用，零依赖、最稳。
 - 预留升级：数据层已集中在 `src/main/store.ts`，日后若需 SQLite（大数据量 / 复杂查询），仅替换该文件即可。
 
@@ -100,6 +109,7 @@
 - 编译产物：`npm run build`（输出到 `out/`）
 - 预览编译产物：`npm run preview`
 - 类型检查：`npm run typecheck`
+- 单元测试：`npm test`（= `vitest run`，跑完即退，不进 watch）
 - 打包 Windows 安装包：`npm run package:win`
 
 > 项目结构：`src/main`（主进程 + 数据存储 + IPC）、`src/preload`（contextBridge 桥接）、`src/renderer`（Vue 3 + Naive UI 界面）、`src/shared`（共享类型）。

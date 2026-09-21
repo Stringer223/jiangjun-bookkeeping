@@ -29,6 +29,20 @@ export const SPEED_OPTIONS: SpeedOption[] = [
   { label: '快', value: 'fast', interval: 80 }
 ]
 
+/** 兜底难度档：speed 在运行期被塞进非法值时用它的间隔 */
+const FALLBACK_SPEED: SpeedLevel = 'medium'
+
+/**
+ * 难度 -> 每格间隔的查表，从 SPEED_OPTIONS 派生。
+ *
+ * 不另写一份数字：旧实现把「中」档的 130 在 intervalMs 的兜底分支里又抄了一遍，
+ * 改 SPEED_OPTIONS 时极易漏掉那一处，兜底值就会与「中」档悄悄不一致。
+ */
+const INTERVAL_BY_SPEED = SPEED_OPTIONS.reduce((acc, o) => {
+  acc[o.value] = o.interval
+  return acc
+}, {} as Record<SpeedLevel, number>)
+
 /** 棋盘格数（正方形） */
 export const BOARD_CELLS = 20
 
@@ -116,7 +130,7 @@ export function useSnakeGame(width = BOARD_CELLS, height = BOARD_CELLS): SnakeGa
 
   const best = computed(() => bestMap.value[speed.value])
   const intervalMs = computed(
-    () => SPEED_OPTIONS.find((o) => o.value === speed.value)?.interval ?? 130
+    () => INTERVAL_BY_SPEED[speed.value] ?? INTERVAL_BY_SPEED[FALLBACK_SPEED]
   )
 
   // ---- 帧循环 ----

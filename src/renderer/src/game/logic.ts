@@ -127,7 +127,10 @@ export function spawnFood(
  *   若允许掉头，新蛇头坐标必然落在自己第二节身上，等于"操作即自杀"；
  * - 其余方向记入 nextDir 缓冲，在下一个 tick 生效。
  *
- * 注意：缓冲只保留一格，同一 tick 内连按多个方向时以第一个不被拒绝的为准。
+ * 注意：缓冲只保留一格，同一 tick 内连按多个方向时，后一次会**覆盖**前一次，
+ * 以**最后一个**被接受的方向为准（见下方 `nextDir: dir` 的覆盖式赋值；
+ * logic.test.ts 的「连按两个方向以最后一个未被拒绝的为准」钉住了这个行为）。
+ * 旧注释写的是「以第一个为准」，与实现和测试都相反，会把人带向错误方向。
  * 这是刻意的取舍 —— 若要支持"一个 tick 内连转两次"需要队列，但经典玩法并不需要。
  */
 export function requestTurn(state: GameState, dir: Direction): GameState {

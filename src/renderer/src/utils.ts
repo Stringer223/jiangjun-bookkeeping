@@ -27,15 +27,28 @@ export function todayStr(): string {
   return formatDate(Date.now())
 }
 
-/** 分类树 -> Naive UI Cascader 的 options */
-export function toCascaderOptions(
-  categories: Category[]
-): { label: string; value: string; children: { label: string; value: string }[] }[] {
-  return categories.map((c) => ({
-    label: c.name,
-    value: c.id,
-    children: (c.children ?? []).map((s) => ({ label: s.name, value: s.id }))
-  }))
+/** Naive UI Cascader 的 option 形状。children 必须是可选的，别写成必填 */
+export interface CascaderOption {
+  label: string
+  value: string
+  children?: { label: string; value: string }[]
+}
+
+/**
+ * 分类树 -> Naive UI Cascader 的 options。
+ *
+ * children 为空时必须**省略这个字段**，不能传 `children: []`：
+ * Naive UI 底层按 `!getChildren(node)` 判定叶子（treemate/es/utils.js），
+ * 而空数组是 truthy，于是这个一级分类会被当成父节点 —— 点它只会展开一个空的
+ * 二级面板，永远不会被选中。用户新建了一级大类、还没加小类时就完全没法用它记账。
+ */
+export function toCascaderOptions(categories: Category[]): CascaderOption[] {
+  return categories.map((c) => {
+    const children = (c.children ?? []).map((s) => ({ label: s.name, value: s.id }))
+    return children.length
+      ? { label: c.name, value: c.id, children }
+      : { label: c.name, value: c.id }
+  })
 }
 
 /**

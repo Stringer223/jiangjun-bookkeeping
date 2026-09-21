@@ -8,7 +8,7 @@ import {
   NInputNumber,
   NModal
 } from 'naive-ui'
-import type { Category, Expense } from '../../../shared/types'
+import type { Category, Expense, ExpenseFilter } from '../../../shared/types'
 import {
   toCascaderOptions,
   findCategoryPath,
@@ -32,7 +32,9 @@ const cascaderOptions = computed(() => toCascaderOptions(categories.value))
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const filter: { start?: string; end?: string; categoryId?: string; keyword?: string } = {}
+    // 用共享类型而不是就地重写一遍形状：两边字段一旦不同步，
+    // 主进程那头改了筛选契约这里不会报错，只会静默失效
+    const filter: ExpenseFilter = {}
     if (month.value) {
       const m = formatMonth(month.value)
       filter.start = `${m}-01`
@@ -44,13 +46,21 @@ async function load(): Promise<void> {
     if (categoryId.value) filter.categoryId = categoryId.value
     if (keyword.value.trim()) filter.keyword = keyword.value.trim()
     expenses.value = await window.api.listExpenses(filter)
+  } catch {
+    // 原来只有 try/finally、没有 catch：查询失败时表格会保留上一次的数据，
+    // 用户看到的是「查询没反应」—— 实际显示的是旧结果，比直接报错更危险
+    message.error('账单加载失败，请重试')
   } finally {
     loading.value = false
   }
 }
 
 onMounted(async () => {
-  categories.value = await window.api.getCategories()
+  try {
+    categories.value = await window.api.getCategories()
+  } catch {
+    message.error('分类加载失败，请重启应用后再试')
+  }
   await load()
 })
 
@@ -132,39 +142,68 @@ async function saveEdit(): Promise<void> {
     return
   }
   const original = expenses.value.find((e) => e.id === editingId.value)
-  if (!original) return
-  await window.api.updateExpense({
-    ...original,
-    amountCents: yuanToCents(editAmount.value),
-    categoryId: editCategory.value,
-    date: editDate.value ? formatDate(editDate.value) : original.date,
-    note: editNote.value.trim() || undefined
-  })
+  if (!original) {
+    // 原来是裸 return：点了保存什么都没发生，用户会以为是自己没点到
+    message.warning('这条记录已经不存在了，请关闭窗口后刷新列表')
+    return
+  }
+  try {
+    await window.api.updateExpense({
+      ...original,
+      amountCents: yuanToCents(editAmount.value),
+      categoryId: editCategory.value,
+      date: editDate.value ? formatDate(editDate.value) : original.date,
+      note: editNote.value.trim() || undefined
+    })
+  } catch {
+    // 失败时既不关弹窗也不提示的话，用户只会反复点保存
+    message.error('保存失败，改动没有写入，请重试')
+    return
+  }
   editOpen.value = false
   message.success('已更新')
   await load()
 }
 
 async function remove(row: Expense): Promise<void> {
-  await window.api.deleteExpense(row.id)
+  try {
+    await window.api.deleteExpense(row.id)
+  } catch {
+    message.error('删除失败，请重试')
+    return
+  }
   message.success('已删除')
   await load()
 }
 
 async function exportCsv(): Promise<void> {
-  const data = await window.api.listExpenses({})
-  // CSV 转义：字段内的半角逗号会被换成全角「，」，以保证列数不错位。
-  // 注意这是有损转换 —— 导出文件里的备注会和 App 内显示的不完全一样
-  const escape = (s: string): string => s.replace(/,/g, '，').replace(/"/g, '""')
-  const header = '日期,分类,金额(元),备注'
+  let data: Expense[]
+  try {
+    data = await window.api.listExpenses({})
+  } catch {
+    message.error('读取账单失败，无法导出')
+    return
+  }
+  // CSV 转义按 RFC 4180：字段一律用双引号包裹，内部的双引号翻倍。
+  // 这样逗号、换行、双引号都能原样保留。
+  // 旧实现只把半角逗号换成全角（有损、不可逆），而且**拦不住备注里的回车** ——
+  // 备注是 textarea，敲回车正是它引导用户做的事，一条带换行的备注
+  // 就会把整份导出文件的列全部顶错位（注释里"以保证列数不错位"因此是不成立的）
+  const quote = (s: string): string => `"${s.replace(/"/g, '""')}"`
+  const header = ['日期', '分类', '金额(元)', '备注'].map(quote).join(',')
   const lines = data.map((e) => {
     const cat = findCategoryPath(categories.value, e.categoryId)
-    return `${e.date},${escape(cat)},${centsToYuan(e.amountCents)},${escape(e.note ?? '')}`
+    return [e.date, cat, centsToYuan(e.amountCents), e.note ?? ''].map(quote).join(',')
   })
   const csv = [header, ...lines].join('\r\n')
-  const ok = await window.api.exportCsv(csv, `账单_${formatMonth(Date.now())}.csv`)
-  if (ok) message.success('导出成功')
-  else message.info('已取消导出')
+  try {
+    const ok = await window.api.exportCsv(csv, `账单_${formatMonth(Date.now())}.csv`)
+    if (ok) message.success('导出成功')
+    else message.info('已取消导出')
+  } catch {
+    // 写文件失败（磁盘满 / 无权限）原来是完全静默的
+    message.error('导出失败，请检查目标目录是否可写')
+  }
 }
 </script>
 

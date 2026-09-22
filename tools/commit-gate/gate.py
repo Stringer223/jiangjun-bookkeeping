@@ -581,11 +581,8 @@ def histogram(findings: list, field: str) -> dict[str, int]:
     return counts
 
 
-def cmd_begin(args: argparse.Namespace) -> int:
-    """`begin`：一轮检查开始前的准备。返回退出码。"""
-    project = Path(args.project).resolve()
-    run_dir = project / RUN_DIR_REL
-
+def _begin_clear_stale_context(run_dir: Path) -> int | None:
+    """删掉上一轮 context.json；删不掉就报错返回退出码，成功返回 None。"""
     # 一进来就先删掉上一轮的 context.json。
     #
     # 为什么：如果本轮 begin 在前面几道检查上被拒（工作区脏、有未跟踪文件…），
@@ -605,7 +602,14 @@ def cmd_begin(args: argparse.Namespace) -> int:
             f"无法删除上一轮的 context.json（{exc}）。"
             "请确认没有别的进程正占用它，然后重跑 begin。"
         )
+    return None
 
+
+def _begin_require_clean_workspace(project: Path, run_dir: Path) -> int | None:
+    """门禁开始前，先确认仓库可用、无中途操作、工作区干净、无未跟踪文件、门禁目录被忽略。
+
+    任何一条不满足都直接拒绝或报错（返回退出码）；全过返回 None。
+    """
     problem = ensure_repo(project)
     if problem:
         return reject(problem)
@@ -648,19 +652,11 @@ def cmd_begin(args: argparse.Namespace) -> int:
             "`git add -A` 扫进提交，而 PASS.tree 记录的是包含它自己的那棵树的哈希，"
             "形成自引用，每次提交指纹都会变。"
         )
+    return None
 
-    tree = write_tree(project)
-    if tree is None:
-        return reject(
-            "无法计算内容指纹（git write-tree 失败）。"
-            "常见原因是索引里有未解决的冲突，请先用 `git status` 查看。"
-        )
 
-    head = head_sha(project)
-    files = changed_files(project, head)
-    if files is None:
-        return script_error("git diff --cached 失败，无法算出本次变更的文件清单")
-
+def _begin_persist_context(run_dir: Path, tree: str, head: str, files: list) -> dict | int:
+    """建运行时目录、写 context.json，返回 context；失败返回退出码（int）。"""
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         clear_previous_run(run_dir)
@@ -681,6 +677,37 @@ def cmd_begin(args: argparse.Namespace) -> int:
         dump_json(run_dir / "context.json", context)
     except OSError as exc:
         return script_error(f"写入 context.json 失败：{exc}")
+    return context
+
+
+def cmd_begin(args: argparse.Namespace) -> int:
+    """`begin`：一轮检查开始前的准备。返回退出码。"""
+    project = Path(args.project).resolve()
+    run_dir = project / RUN_DIR_REL
+
+    code = _begin_clear_stale_context(run_dir)
+    if code is not None:
+        return code
+
+    code = _begin_require_clean_workspace(project, run_dir)
+    if code is not None:
+        return code
+
+    tree = write_tree(project)
+    if tree is None:
+        return reject(
+            "无法计算内容指纹（git write-tree 失败）。"
+            "常见原因是索引里有未解决的冲突，请先用 `git status` 查看。"
+        )
+
+    head = head_sha(project)
+    files = changed_files(project, head)
+    if files is None:
+        return script_error("git diff --cached 失败，无法算出本次变更的文件清单")
+
+    context = _begin_persist_context(run_dir, tree, head, files)
+    if isinstance(context, int):
+        return context
 
     emit(f"本轮开始。内容指纹 = {tree}")
     emit(f"runId = {context['runId']}")
@@ -797,29 +824,12 @@ def _check_typecheck(run_dir: Path, context: dict) -> int | None:
     return None
 
 
-def _check_quality(run_dir: Path, context: dict) -> int | None:
-    """校验质量维度。通过返回 None，否则返回退出码。"""
-    if not context.get("qualityRequired"):
-        return None  # 纯文档/配置变更，本维度不适用
+def _quality_validate_scope(quality: dict, context: dict) -> int | None:
+    """校验「覆盖范围 = 本次变更文件的超集」。不通过返回退出码，否则返回 None。
 
-    status, quality = load_json(run_dir / "quality.json")
-    if status == STATUS_MISSING:
-        return reject(
-            "找不到 quality.json —— 质量检查这一轮没有产出结果。"
-            "请确认 quality-engineer 已经跑完并写出该文件。"
-        )
-    if status == STATUS_BROKEN:
-        return reject(
-            "quality.json 存在但读不出对象（编码不对，或顶层不是 JSON 对象）。"
-            "请让 quality-engineer 重新产出。"
-        )
-    assert quality is not None
-
-    if quality.get("runId") != context.get("runId"):
-        return reject("quality.json 的 runId 与本轮不符，这份结果不能算数。")
-
-    # 覆盖范围必须是本次变更文件的超集。这条把「只查改动」从散文
-    # 变成了机器可校验的不变式 —— 否则 agent 可以声称查了其实没查。
+    这条把「只查改动」从散文变成了机器可校验的不变式 —— 否则 agent
+    可以声称查了其实没查。
+    """
     scope = quality.get("scope")
     if not isinstance(scope, dict):
         # scope 被写成字符串/数组时，直接 `.get("scanned")` 会抛 AttributeError，
@@ -854,21 +864,15 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
             f"{listing}\n"
             "请让 quality-engineer 补齐这些文件后重新产出 quality.json。"
         )
+    return None
 
-    # 三道校验（是数组 → 每项是对象 → 取值合法）与后面的计数之间，
-    # 顺序由 _verified_findings 内部保证，不再依赖这几段代码在本函数里的
-    # 相对位置 —— 那正是把它抽成唯一入口的原因（histogram 对不认识的取值
-    # 是静默跳过的，顺序写错就会重新打开那处 fail-open）。
-    findings, code = _verified_findings(quality)
-    if code is not None:
-        return code
-    assert findings is not None
 
-    # 门禁自己重算，不信 agent 填的 counts / confirmed
+def _quality_verify_counts(quality: dict, findings: list, confirmed_findings: list) -> int | None:
+    """门禁自己重算 counts / confirmed，与 agent 填的字段逐项核对。
+
+    不一致就拒绝（标记不可信）；全对返回 None。
+    """
     by_level = histogram(findings, "level")
-    confirmed_findings = [
-        f for f in findings if str(f.get("confidence", "")).lower() == CONFIRMED
-    ]
     # confirmed 只统计**阻断级别**（critical/high）—— 它与 counts 的语义不同：
     # counts 是全量直方图，confirmed 是「够格阻断的有几条」。
     # 早先把四个级别都算进来，导致 agent 按契约只写 critical/high 时，
@@ -894,6 +898,50 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
                 f"quality.json 的 {field} 与 findings 明细对不上，标记不可信：\n{detail}\n"
                 "请让 quality-engineer 如实汇总，不要手工改写。"
             )
+    return None
+
+
+def _check_quality(run_dir: Path, context: dict) -> int | None:
+    """校验质量维度。通过返回 None，否则返回退出码。"""
+    if not context.get("qualityRequired"):
+        return None  # 纯文档/配置变更，本维度不适用
+
+    status, quality = load_json(run_dir / "quality.json")
+    if status == STATUS_MISSING:
+        return reject(
+            "找不到 quality.json —— 质量检查这一轮没有产出结果。"
+            "请确认 quality-engineer 已经跑完并写出该文件。"
+        )
+    if status == STATUS_BROKEN:
+        return reject(
+            "quality.json 存在但读不出对象（编码不对，或顶层不是 JSON 对象）。"
+            "请让 quality-engineer 重新产出。"
+        )
+    assert quality is not None
+
+    if quality.get("runId") != context.get("runId"):
+        return reject("quality.json 的 runId 与本轮不符，这份结果不能算数。")
+
+    code = _quality_validate_scope(quality, context)
+    if code is not None:
+        return code
+
+    # 三道校验（是数组 → 每项是对象 → 取值合法）与后面的计数之间，
+    # 顺序由 _verified_findings 内部保证，不再依赖这几段代码在本函数里的
+    # 相对位置 —— 那正是把它抽成唯一入口的原因（histogram 对不认识的取值
+    # 是静默跳过的，顺序写错就会重新打开那处 fail-open）。
+    findings, code = _verified_findings(quality)
+    if code is not None:
+        return code
+    assert findings is not None
+
+    confirmed_findings = [
+        f for f in findings if str(f.get("confidence", "")).lower() == CONFIRMED
+    ]
+
+    code = _quality_verify_counts(quality, findings, confirmed_findings)
+    if code is not None:
+        return code
 
     blocking = [f for f in confirmed_findings if str(f.get("level", "")).lower() in BLOCKING_LEVELS]
     if blocking:
@@ -911,24 +959,18 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
     return None
 
 
-def cmd_check(args: argparse.Namespace) -> int:
-    """`check`：一轮检查结束后做判定。返回退出码。"""
-    project = Path(args.project).resolve()
-    run_dir = project / RUN_DIR_REL
+def _guard_fingerprint(project: Path, context: dict) -> tuple[int | None, str | None]:
+    """三道前置断言：指纹未变、工作区==暂存区、未跟踪文件没变多。
 
-    status, context = load_json(run_dir / "context.json")
-    if status == STATUS_MISSING:
-        return reject(
-            "找不到本轮的 context.json —— 说明没有正确执行 begin，流程不完整。"
-            "请重新从 `gate.py begin` 开始。"
-        )
-    if status == STATUS_BROKEN:
-        return script_error("context.json 存在但读不出对象（被写坏了，或顶层不是 JSON 对象）")
-    assert context is not None
-
+    返回 (退出码, 指纹)：退出码非 None 表示该拒绝/报错，直接返回给 main；
+    全过时退出码为 None、指纹供后面签发通行证用。
+    """
     expected_tree = context.get("tree")
     if not expected_tree:
-        return script_error("context.json 里没有 tree 字段，文件可能被改坏了")
+        # 判空必须收在这里，和指纹比对待在一起：少了这一道，下面的
+        # `current_tree != expected_tree` 会把「context.json 被写坏（没有 tree 字段）」
+        # 报成「检查期间代码被改动」—— 两个完全不同的排查方向，实测踩过这类误判。
+        return script_error("context.json 里没有 tree 字段，文件可能被改坏了"), None
 
     # 第一道：指纹是否还是同一个。这一条同时兜住了「tester 越权改了代码」的风险 ——
     # tester 的工具集里有 Edit，结构上它是能改的，只能靠这里确定性发现。
@@ -936,32 +978,32 @@ def cmd_check(args: argparse.Namespace) -> int:
     #   端点比对在原理上看不见 —— 那部分只能靠 agent 自律，见 tester.md 的门禁模式）
     current_tree = write_tree(project)
     if current_tree is None:
-        return script_error("复算指纹时 git write-tree 失败，无法判定")
+        return script_error("复算指纹时 git write-tree 失败，无法判定"), None
     if current_tree != expected_tree:
         return reject(
             "检查期间代码被改动，本轮结果作废。\n"
             f"  开始时的指纹：{expected_tree}\n"
             f"  现在的指纹：  {current_tree}\n"
             "如果刚才是子代理跑了测试并顺手改了代码，请撤销那些改动后重跑一轮。"
-        )
+        ), None
 
     # 第二道：工作区是否仍等于暂存区。只看 tree 会漏掉这种情形 ——
     # 有人改了文件但没 git add，此时 tree 不变、而测试跑的是新代码。
     unstaged = changes_unstaged(project)
     if unstaged is None:
-        return script_error("git diff --quiet 返回了预期之外的状态，无法判断工作区是否干净")
+        return script_error("git diff --quiet 返回了预期之外的状态，无法判断工作区是否干净"), None
     if unstaged:
         return reject(
             "工作区出现了未暂存的改动 —— 检查跑的是改动后的代码，"
             "而提交的会是暂存区里的旧内容，两者不对应。\n"
             "请确认改动是否有意为之：有意就 `git add -A` 后重跑一轮，无意就撤销掉。"
-        )
+        ), None
 
     # 第三道：未跟踪文件有没有变多。检查期间新冒出来的文件同样会让
     # 「测过的内容」与「提交的内容」对不上。
     untracked_now = untracked_files(project)
     if untracked_now is None:
-        return script_error("git ls-files --others 失败，无法判断未跟踪文件")
+        return script_error("git ls-files --others 失败，无法判断未跟踪文件"), None
     before = set(context.get("untracked") or [])
     new_ones = sorted(set(untracked_now) - before)
     if new_ones:
@@ -970,20 +1012,16 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"检查期间产生了新的未跟踪文件：\n{listing}\n"
             "它们不在本次提交里（提交的是暂存区的内容），但可能被测试依赖。"
             "请决定：要提交就 `git add` 后重跑一轮，不该有就删掉。"
-        )
+        ), None
 
-    # 第四~六道：三个维度
-    for checker in (_check_tests, _check_typecheck, _check_quality):
-        code = checker(run_dir, context)
-        if code is not None:
-            return code
+    return None, expected_tree
 
-    _, tests = load_json(run_dir / "tests.json")
-    _, quality = load_json(run_dir / "quality.json")
 
+def _build_pass_payload(context: dict, tests: dict, quality: dict, expected_tree: str) -> dict:
+    """全过时构造 PASS.json 的内容（被 _issue_ticket 调用）。"""
     # 全过 —— 签发通行证
     passed_at = int(time.time() * 1000)
-    pass_payload = {
+    return {
         "schema": SCHEMA_VERSION,
         "action": "commit",
         "runId": context.get("runId"),
@@ -1016,6 +1054,13 @@ def cmd_check(args: argparse.Namespace) -> int:
             },
         },
     }
+
+
+def _issue_ticket(run_dir: Path, context: dict, expected_tree: str) -> int:
+    """全过 —— 写 PASS.json / PASS.tree / PASS.head 并输出放行信息。"""
+    _, tests = load_json(run_dir / "tests.json")
+    _, quality = load_json(run_dir / "quality.json")
+    pass_payload = _build_pass_payload(context, tests, quality, expected_tree)
     try:
         dump_json(run_dir / "PASS.json", pass_payload)
         # PASS.tree / PASS.head 是单行纯文本：给 git pre-commit 那个 shell 脚本读的。
@@ -1047,6 +1092,34 @@ def cmd_check(args: argparse.Namespace) -> int:
         emit("  质量检查：本轮不适用（纯文档/配置变更）")
     emit("可以提交了。")
     return EXIT_PASS
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """`check`：一轮检查结束后做判定。返回退出码。"""
+    project = Path(args.project).resolve()
+    run_dir = project / RUN_DIR_REL
+
+    status, context = load_json(run_dir / "context.json")
+    if status == STATUS_MISSING:
+        return reject(
+            "找不到本轮的 context.json —— 说明没有正确执行 begin，流程不完整。"
+            "请重新从 `gate.py begin` 开始。"
+        )
+    if status == STATUS_BROKEN:
+        return script_error("context.json 存在但读不出对象（被写坏了，或顶层不是 JSON 对象）")
+    assert context is not None
+
+    # 「tree 字段缺失」的判空收在 _guard_fingerprint 里 —— 它与指纹比对是同一件事，
+    # 两处各判一次会让「context.json 被写坏」被报成「检查期间代码被改动」。
+    code, expected_tree = _guard_fingerprint(project, context)
+    if code is not None:
+        return code
+    # 三个维度：tests / typecheck / quality
+    for checker in (_check_tests, _check_typecheck, _check_quality):
+        code = checker(run_dir, context)
+        if code is not None:
+            return code
+    return _issue_ticket(run_dir, context, expected_tree)
 
 
 def cmd_revoke(args: argparse.Namespace) -> int:

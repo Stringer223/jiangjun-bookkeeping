@@ -14,9 +14,11 @@
 退出码 0 = 全部通过。
 """
 
+import ast
 import atexit
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -139,8 +141,8 @@ def setup_repo() -> None:
     RUN = REPO / ".workbuddy" / "commit-gate" / "run"
 
 
-def _force_rmtree(path: Path) -> None:
-    """删掉整棵目录树，先去掉只读位再删。
+def _force_rmtree(path: Path) -> list[str]:
+    """删掉整棵目录树，先去掉只读位再删。返回没做干净的地方的明细，空列表 = 干净。
 
     **不能只写 `shutil.rmtree(path, ignore_errors=True)`**：git 在 Windows 上把
     `.git/objects` 里的文件设成只读，直接删会失败，而 `ignore_errors=True` 会把失败
@@ -148,20 +150,51 @@ def _force_rmtree(path: Path) -> None:
     （这个坑就是这么撞出来的：跑完一看 temp 里躺了三个。）
 
     `chmod` 到 `S_IWRITE` 就够了，不用管原来是什么权限。
+
+    **但「不吞」得靠返回值，不能靠抛。** chmod 失败原先是一个 `except OSError: pass`，
+    与本函数的设计意图正相反 —— 它自己写着「静默吞掉会让临时仓库悄悄堆积」，
+    却把 chmod 的失败静默吞了。改成收集明细返回，是为了让 `_cleanup_temp_repos()`
+    能「一个失败不带累其余」：直接抛的话那个循环会中断，剩下的临时仓库整片泄漏，
+    反而制造出本函数要防的那个后果。
     """
-    for root, dirs, files in os.walk(path):
+    problems: list[str] = []
+
+    def _on_walk_error(exc: OSError) -> None:
+        # os.walk 默认 onerror=None 会把 scandir 的失败静默跳过（整棵子树看不见），
+        # 于是下面的 chmod 明细不完整 —— 显式收进来，别只靠最后那次 exists() 兜底。
+        problems.append(f"遍历 {exc.filename} 失败：{exc!r}")
+
+    for root, dirs, files in os.walk(path, onerror=_on_walk_error):
         for name in dirs + files:
+            target = os.path.join(root, name)
             try:
-                os.chmod(os.path.join(root, name), stat.S_IWRITE)
-            except OSError:
-                pass
+                os.chmod(target, stat.S_IWRITE)
+            except OSError as exc:
+                # 记下来交回调用方，不在这里 pass 掉：chmod 失败通常意味着
+                # 后面的 rmtree 也会失败，而「临时仓库没删掉」正是要防的事。
+                problems.append(f"chmod {target} 失败：{exc!r}")
     shutil.rmtree(path, ignore_errors=True)
+    # rmtree 配了 ignore_errors=True，失败既不抛也无声，所以删完只能再核实一遍
+    # 目录是否真的消失；还在就记一条明细。
+    if path.exists():
+        problems.append(f"{path} 在 rmtree 之后仍然存在（临时仓库没清掉）")
+    return problems
 
 
 def _cleanup_temp_repos() -> None:
-    """删掉本进程建过的所有临时仓库（由 atexit 注册，正常结束与异常退出都会跑到）。"""
+    """删掉本进程建过的所有临时仓库（由 atexit 注册，正常结束与异常退出都会跑到）。
+
+    逐个删、**一个失败不带累其余**：这里若因为某个仓库删不掉就 return 或者抛出去，
+    剩下的仓库会整片留在 temp 里 —— 正是 `_force_rmtree` 那段注释要防的情形。
+    所以只收集明细，循环走完再统一报到 stderr（stdout 要留给用例汇总）。
+    """
+    problems: list[str] = []
     for root in _CLEANUP:
-        _force_rmtree(root)
+        problems.extend(_force_rmtree(root))
+    if problems:
+        sys.stderr.write("清理临时仓库时有失败项：\n")
+        for item in problems:
+            sys.stderr.write(f"  - {item}\n")
 
 
 # 用 atexit 而不是在 main() 末尾手写清理：中途抛异常时也要收干净，
@@ -755,6 +788,189 @@ def _case_in_progress_markers() -> None:
     ))
 
 
+# 钩子里豁免清单的写法：`for m in .git/X .git/Y; do` / `for d in .git/Z; do`。
+# 变量名用来分流「文件型 / 目录型」，条目里的 `.git/` 前缀要归一化掉
+# （gate.py 那份是裸名字，不归一化两边永远不相等，用例就成了常年 FAIL 的噪音）。
+_HOOK_LOOP_RE = re.compile(r"^\s*for\s+(?P<var>\w+)\s+in\s+(?P<items>[^;]+);\s*do\s*$")
+
+
+def _hook_exempt_markers() -> tuple[set[str], set[str]]:
+    """从 `.githooks/pre-commit` 解析出「中途操作」豁免清单，返回 (文件型, 目录型)。
+
+    **解析而不是在测试里再抄一份常量**：抄一份就等于又造出一个需要手工同步的副本，
+    而本组用例要防的恰恰是「两份清单漂移、谁都没发现」—— 拿一份副本去比，
+    副本自己漂了就永远比得出来一个假的「一致」。
+    """
+    files: set[str] = set()
+    dirs: set[str] = set()
+    for line in HOOK_SRC.read_text(encoding="utf-8").splitlines():
+        m = _HOOK_LOOP_RE.match(line)
+        if not m:
+            continue
+        # 只认 `for ... in .git/xxx ...; do` 这种循环；钩子里别的 `for`（将来加的）
+        # 不会被误当成豁免清单。
+        items = {t[len(".git/"):] for t in m.group("items").split() if t.startswith(".git/")}
+        if not items:
+            continue
+        (dirs if m.group("var") == "d" else files).update(items)
+    return files, dirs
+
+
+def _gate_in_progress_markers() -> tuple[str, ...]:
+    """用 `ast` 从 `gate.py` 的源码里读出 `IN_PROGRESS_MARKERS` 的真实取值。
+
+    不 `import` 那个模块（它顶层跑的东西不适合被当库加载），也不在测试里写死
+    那 6 项 —— 写死就退化成了「又一个需要手工同步的副本」，与本题的目的一致相反。
+    """
+    tree = ast.parse(GATE_SRC.read_text(encoding="utf-8"))
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        if isinstance(target, ast.Name) and target.id == "IN_PROGRESS_MARKERS":
+            return tuple(str(x) for x in ast.literal_eval(node.value))
+    raise LookupError(f"{GATE_SRC} 里没有 IN_PROGRESS_MARKERS 的赋值")
+
+
+def _assert_marker_lists_match(gate_markers: set[str], hook_markers: set[str]) -> None:
+    """第 1 层：两份清单集合相等 + 两侧都非空。
+
+    从 gate.py 与 pre-commit 钩子各自解析出来的清单做集合比较（不写死任何一份），
+    同时钉住「两侧都非空」，防止「把清单全删掉」这种最危险的 fail-open 让用例变绿。
+    """
+    # 第 1 层：集合相等。这是**真正的一致性** —— 两边各解析一遍再比，
+    # 比的是「两份文件当下写的什么」，而不是「测试以为它们写的什么」。
+    if gate_markers == hook_markers:
+        results.append((
+            "T-B1 gate.py 的 IN_PROGRESS_MARKERS 与钩子的豁免清单完全一致",
+            True, "",
+        ))
+    else:
+        results.append((
+            "T-B1 gate.py 的 IN_PROGRESS_MARKERS 与钩子的豁免清单完全一致",
+            False,
+            "两份清单漂移了。漂移是 fail-open 的：gate.py 少一项 = begin 拦不住、"
+            "检查跑在半个合并态上；钩子少一项 = 收尾冲突的提交被无谓拦住。"
+            f"\n      仅 gate.py 有: {sorted(gate_markers - hook_markers)}"
+            f"\n      仅 pre-commit 有: {sorted(hook_markers - gate_markers)}",
+        ))
+
+    # 两边同时被删空时上面那条也会判「相等」。那是最危险的 fail-open，
+    # 所以单独钉一下两侧都非空 —— 否则「把清单全删掉」反而是让用例变绿的做法。
+    results.append((
+        "T-B1 两份清单都非空（两侧同时被删空时「相等」毫无意义）",
+        bool(gate_markers) and bool(hook_markers),
+        "" if (gate_markers and hook_markers)
+        else f"gate={sorted(gate_markers)} pre-commit={sorted(hook_markers)}",
+    ))
+
+
+def _assert_clean_begin_passes() -> bool:
+    """第 2 层第一小节：先确认「干净仓库的 begin 能过」。
+
+    begin 的检查有先后顺序（先 ensure_repo、再 in_progress_operation），所以先确认
+    干净仓库能过 —— 否则下面每一条拒绝都可能来自别的原因，断言全绿却什么都没验到。
+    返回 False 表示前提不成立，调用方应停止后续端到端断言。
+    """
+    # 第 2 层：端到端。begin 的检查有先后顺序（先 ensure_repo、再
+    # in_progress_operation），所以先确认「干净仓库的 begin 能过」——
+    # 否则下面每一条拒绝都可能来自别的原因（工作区脏、有未跟踪文件…），
+    # 断言仍然全绿、却什么都没验到。
+    base = gate("begin")
+    if base.returncode != 0:
+        results.append((
+            "T-B1 干净仓库的 begin 应先通过（否则下面「标记导致拒绝」验不出来）",
+            False,
+            f"退出码 {base.returncode}\n      {(base.stdout or '')[:300]}",
+        ))
+        return False
+    return True
+
+
+def _assert_each_marker_rejected(gate_markers: set[str], hook_dirs: set[str]) -> None:
+    """第 2 层第二小节：逐个标记、端到端拒绝并清理；最后收尾自检。
+
+    对每个标记，`begin` 都真的拒绝（退出码 1，不是 2「脚本自己出错」）；
+    标记必须立刻清掉以免污染后面全部用例；全部清掉后 begin 应重新通过。
+    """
+    for marker in sorted(gate_markers):
+        target = REPO / ".git" / marker
+        # 目录型 vs 文件型按钩子里的写法分流（`for d in` 的建目录），
+        # 这样两种形态都真的覆盖到，而不是 6 项全用文件试一遍。
+        is_dir = marker in hook_dirs
+        try:
+            if is_dir:
+                target.mkdir(exist_ok=True)
+            else:
+                target.write_text("x\n", encoding="utf-8")
+            # 期望 1（拒绝）而不是 2（脚本自己出错）—— check() 比的是等值，
+            # 传 1 就已经把 2 排除掉了。同时断言输出里出现标记名，
+            # 免得「因为别的原因被拒」也算过。
+            check(f"T-B1 begin 见到 .git/{marker} 必须拒绝（退出码 1，不是 2）",
+                  1, gate("begin"), f".git/{marker}")
+        finally:
+            # 必须**立刻**清掉：标记留在 .git/ 里会污染后面全部用例
+            # （包括真实提交的 T-H6 —— 钩子会把它的提交整片放行，故障点被掩盖）。
+            # 用 finally 保证即使上面断言抛异常也清得掉。
+            try:
+                if target.is_dir():
+                    target.rmdir()
+                elif target.exists():
+                    target.unlink()
+            except OSError as exc:
+                results.append((
+                    f"T-B1 清理 .git/{marker} 失败（会污染后面的用例）",
+                    False, f"{exc!r}",
+                ))
+
+    # 收尾自检：标记全清掉之后 begin 必须重新通过 —— 既证明本组把 REPO 恢复原状了，
+    # 也反过来证明上面那些拒绝确实是被标记触发的，而不是仓库本身一直有问题。
+    check("T-B1 标记清掉后 begin 重新通过（本组已恢复 REPO 原状）", 0, gate("begin"))
+
+
+def _case_begin_in_progress() -> None:
+    """T-B1: 「中途操作」清单一致性 + begin 侧端到端拒绝。
+
+    背景：这份清单在**两个部件里各有一份**，语义还正好相反 ——
+    `gate.py` 的 `IN_PROGRESS_MARKERS` 命中就**拒绝 begin**，
+    `.githooks/pre-commit` 的豁免清单命中就**放行提交**。
+    两份靠手工同步、此前没有任何机器校验，而漂移是 **fail-open** 的：
+    漏一项 = 门禁静默放行。上一轮修的 `sequencer` 漂移就是这么来的
+    （gate.py 少一项、钩子多一项，谁都没发现）。
+
+    现有 T-X 组只验了**钩子那一侧**（放行），`begin` 那一侧一条都没有 ——
+    也就是说「gate.py 少一项」这个失败模式至今无人守。本组补上，分两层：
+
+    1. 两份清单**集合相等**（从两边各自解析，不写死任何一份）
+    2. 对每个标记，`begin` 都真的拒绝（退出码 1，不是 2「脚本自己出错」）
+    """
+    try:
+        hook_files, hook_dirs = _hook_exempt_markers()
+        gate_markers = set(_gate_in_progress_markers())
+    except (OSError, SyntaxError, TypeError, ValueError, LookupError) as exc:
+        # 解析不了就不让它抛出去：main() 的兜底会记成「未预期的异常中断」，
+        # 整套用例以 traceback 收场、连汇总都看不到。记一条明确的 FAIL 更有用。
+        results.append((
+            "T-B1 两份「中途操作」清单无法解析（用例前提不成立）",
+            False,
+            f"{exc!r}\n      解析失败通常说明清单的写法变了，用例要跟着更新；"
+            "不能让它变成 traceback 把汇总吞掉。",
+        ))
+        return
+
+    hook_markers = hook_files | hook_dirs
+
+    # 第 1 层：两份清单集合相等 + 两侧都非空。
+    _assert_marker_lists_match(gate_markers, hook_markers)
+
+    # 第 2 层：端到端拒绝 + 清理，细节见下面两个助手。
+    if not _assert_clean_begin_passes():
+        return
+    _assert_each_marker_rejected(gate_markers, hook_dirs)
+
+
 def _run_cases() -> None:
     """跑完所有用例，只把结果记进 `results`；不做汇总、不返回退出码。
 
@@ -797,6 +1013,11 @@ def _run_cases() -> None:
     non_ascii_path_case()
     quality_not_required_case()
 
+    # 清单一致性那一组同样不依赖 sh（只是解析两个文件 + 调 gate("begin")），
+    # 所以放在这里同理：没有 sh 的环境下也该跑得到它 —— 而它守的正是
+    # 「钩子那侧有 T-X 组、begin 这侧没人守」的那个缺口。
+    _case_begin_in_progress()
+
     # 钩子层 / HEAD 绑定（依赖 sh）。没有 sh 时 hook() 记 1 条 FAIL 并抛 CaseAborted，
     # 由 main() 接住收尾；其余（T-X 那一组）随之不再执行——它们同样依赖 sh。
     _case_hook_head_binding()
@@ -834,6 +1055,9 @@ def main() -> int:
     # 中文输出必须显式 UTF-8：Windows 上 Python 默认按 GBK 写 stdout，
     # 打印中文会直接抛 UnicodeEncodeError（阶段 0 踩过同一个坑）
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # stderr 也要一起改：atexit 注册的 _cleanup_temp_repos 那条告警走的就是 stderr，
+    # 调用方按 UTF-8 读，不显式指定就会与 stdout 的约定不一致（本机 PYTHONUTF8=1 掩盖了）。
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     try:
         _run_cases()

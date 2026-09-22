@@ -27,41 +27,51 @@ skills: git-save
 （这件事在同一个仓库里被独立验证过两次）。所以：
 
 - **有 `PowerShell`** → 用它，下面各步的命令就是按它写的（已验证）。
-- **只有 `Bash`** → 一样能跑完整个流程，只需把落盘写法换成重定向，例如
-  `python tools/commit-gate/gate.py begin --project . > "$TMPDIR/gate.txt" 2>&1`。
-  `git`、`python`、`cd`、重定向、heredoc 在 Bash 下都实测通过、退出码 0。
+- **只有 `Bash`** → 一样能跑完整个流程。下面第 1/2/5/8/13 步都补了 Bash 写法，照着用即可：
+  落盘换成 `> "$TMPDIR/...txt" 2>&1`、退出码用 `echo "exit=$?"` 紧跟、PowerShell 的 `2>$null` 换成 `2>/dev/null`、
+  第 1 步用 `[ -f ... ] || { ...; exit 1; }` 守卫。`git`、`python`、`cd`、重定向、heredoc 在 Bash 下都实测通过、退出码 0。
 
 **关于 `Bash` 的两个噪音，别被它们误导：** 它几乎每次都往 stderr 打两行
 `shell-runtime-bash-env.sh: line 3: dirname: command not found` 与 `cd: null directory` ——
 那是**包装脚本自己的噪音，不是命令失败**，照常看退出码即可。
-**它真正缺的是核心工具链 —— 不是一个两个，而是一大批。** 在这个 shim 环境里实测：
+**它真正缺的是核心工具链 —— 不是一个两个，而是一大批。** 在这个 shim 环境里实测（用 `command -v` 与 `type` 两者结合区分「真命令 / Windows .EXE / shim 函数」）：
 
-- **不存在的**（`command not found`、退出码 127）：`ls` `mkdir` `wc` `cat` `cp` `mv` `sed` `awk`
-  `grep` `head` `tail` `uniq` `chmod` `touch` `dirname` `basename` `env` `xargs` `tee` `cut` `tr` `date`
-  —— **共 22 个**
-- **可用的**：`rm` `echo` `printf` `test` `find` `sort` `rmdir`
+- **已知缺失（非穷举，实测清单如下）**（`command -v` 与 `type` 均无输出、退出码 127）：
+  `ls` `mkdir` `wc` `cat` `cp` `mv` `sed` `awk` `grep` `head` `tail` `uniq` `chmod` `touch` `dirname`
+  `basename` `env` `xargs` `tee` `cut` `tr` `date` `which` `sleep` `diff` `mktemp` `du` `df` `ln`
+  `realpath` `readlink` `stat` `seq` `split` `yes` `uname` `id` `file` `wget` `less` `more` `nl` `od`
+  `tree` `zcat`
+  —— 以上 **45 个只是抽测到的，远不止「22 个」，且非穷举**，请勿当成全集
+- **看似可用但有坑的**（都别当 POSIX 工具用）：
+  - `find` → `command -v` 指向 `C:\Windows\system32\find.EXE`、`type -t` 为 `file`（Windows 程序），**不是 POSIX find**，`find . -name '*.py'` 直接失败
+  - `sort` → 同理指向 `C:\Windows\system32\sort.EXE`，**不是 POSIX sort**，`sort -u` 会被当成文件名参数
+  - `rm` / `rmdir` → `type -t` 为 `function`，是 shim 注入的 shell 函数（真身在 `${CODEBUDDY_SAFE_DELETE_BIN_DIR}` 下），**不是真 coreutils**
+- **确认可用的**：
+  - `echo` `printf` `test` —— `type -t` 均为 `builtin`（bash 内建，语义正确）
+  - `git`（`/f/Git/cmd/git`）、`python`（`.workbuddy` 自带的真实解释器）—— `type -t` 为 `file`，是真正的可执行文件
 
 **所以：别依赖任何 coreutils。** 要列目录、读写文件、做文本处理，一律用 `python`；
 要看仓库状态就用 git 自带的命令。两个具体的坑：
 
 - **不要用 `ls`** —— 列目录改用
   `python -c "import pathlib;[print(p.name) for p in pathlib.Path('目录').iterdir()]"`
-- **`rm` 虽然可用，但别拿它当「环境是完整的」的证据** —— 这一批里只有它和另外五个是漏网的。
+- **`rm` / `rmdir` 虽能删文件，但别拿它当「环境完整」的证据** —— 它们是 shim 注入的 shell 函数，不是真 coreutils；
+  `find` / `sort` 更是 Windows 的 .EXE，语义与 POSIX 完全不同，绝不能当 POSIX 工具用。
 
-（这里先后写过两句不准确的话：一句是「Bash 不可靠、命令有时直接非 0 退出」——实测在 `git`/`python`
-上从没出现过；另一句是「缺 `ls`/`mkdir`/`wc` 这几个」—— 那是**严重低估**，实测缺 22 个。
-这类清单必须实测后再写，写少了会让人照着踩坑。）
+（这类清单必须实测后再写：以前写「缺 `ls`/`mkdir`/`wc` 这几个」是**严重低估**，后来补到「22 个」仍然不准 ——
+实测抽测就缺 45 个且非穷举。写少了会让人照着踩坑。）
 
 **② stdout 常常不回显。** 这条与 shell 无关，但**落盘写法两边不同**，按你实际拿到的那边选：
 
 | | 落盘写法 | 看哪个退出码 |
 |---|---|---|
 | `PowerShell` | `<命令> 2>&1 \| Out-File -Encoding utf8 "$env:TEMP\gate.txt"` | `$LASTEXITCODE` |
-| `Bash` | `<命令> > "/tmp/gate.txt" 2>&1` | `$?` |
+| `Bash` | `<命令> > "$TMPDIR/gate.txt" 2>&1` | `$?` |
 
 - 写完**必须用 Read 工具读那个文件**，不要指望命令自己把输出打回来
 - **判断成败看退出码**，不要只看文本。非 0 即失败
 - `gate.py` 的拒绝理由就是写给用户看的诊断，一定要落到文件里再读出来，**别让它丢了**
+- **Bash 落盘千万别写成 `/tmp/gate.txt`**：`/tmp/...` 是 Git Bash 的 POSIX 别名，**Read 工具不认**（报 `File does not exist`）。命令其实跑成功、文件也真写出来了，但 Read 一读就失败，于是 `gate.py` 那段「拒绝理由」整段丢失 —— 而那正是给人看的诊断。用 `$TMPDIR/gate.txt`（`$TMPDIR` 解析出来是 Windows 路径，Read 能读）。
 
 **另外：取仓库路径统一用 `--project .`，不要给 `gate.py` 传一个自己拼出来的绝对路径。**
 两个理由：① 你的工作目录就是仓库根，`gate.py` 自己会把它解析成绝对路径；
@@ -79,6 +89,12 @@ skills: git-save
 if (-not (Test-Path "tools/commit-gate/gate.py")) { "不是受管仓库，停下"; exit 1 }
 ```
 
+Bash 守卫（等价写法）：
+
+```bash
+[ -f tools/commit-gate/gate.py ] || { echo "不是受管仓库，停下"; exit 1; }
+```
+
 `gate.py` 不存在就说明这不是受管仓库，**告知用户并停下**，不要自己造一套流程。
 
 ### 2. 先看有没有活
@@ -86,6 +102,13 @@ if (-not (Test-Path "tools/commit-gate/gate.py")) { "不是受管仓库，停下
 ```powershell
 git status --short
 git log "@{u}..HEAD" --oneline 2>$null
+```
+
+Bash 版（把 `2>$null` 换成 `2>/dev/null`）：
+
+```bash
+git status --short
+git log "@{u}..HEAD" --oneline 2>/dev/null
 ```
 
 - **没有改动、但本地有未推送的提交** → 没有新内容要提交，跑检查毫无意义。
@@ -119,7 +142,14 @@ python tools/commit-gate/gate.py begin --project . 2>&1 | Out-File -Encoding utf
 "exit=$LASTEXITCODE" | Out-File -Append -Encoding utf8 "$env:TEMP\gate-begin.txt"
 ```
 
-然后 Read `$env:TEMP\gate-begin.txt`。
+Bash 版（落盘用 `$TMPDIR`，并紧跟一行记录退出码）：
+
+```bash
+python tools/commit-gate/gate.py begin --project . > "$TMPDIR/gate-begin.txt" 2>&1
+echo "exit=$?"
+```
+
+然后 Read `$TMPDIR/gate-begin.txt`（PowerShell 下读 `$env:TEMP\gate-begin.txt`）。
 
 - **非 0 就把文件内容原样贴给用户并停下。** `begin` 的拒绝理由都是可操作的
   （工作区没暂存干净、有未跟踪文件、`.workbuddy/` 没被 gitignore 等）。
@@ -178,7 +208,14 @@ python tools/commit-gate/gate.py check --project . 2>&1 | Out-File -Encoding utf
 "exit=$LASTEXITCODE" | Out-File -Append -Encoding utf8 "$env:TEMP\gate-check.txt"
 ```
 
-然后 Read 那个文件。
+Bash 版（落盘用 `$TMPDIR`，并紧跟一行记录退出码）：
+
+```bash
+python tools/commit-gate/gate.py check --project . > "$TMPDIR/gate-check.txt" 2>&1
+echo "exit=$?"
+```
+
+然后 Read `$TMPDIR/gate-check.txt`（PowerShell 下读 `$env:TEMP\gate-check.txt`）。
 
 - **非 0 就把内容原样贴给用户，然后停下。**
 - 不要「顺手修一下让它通过」。`check` 的拒绝理由本身就是给用户看的诊断，
@@ -223,6 +260,13 @@ git rev-list --count "@{u}..HEAD"
 ```powershell
 python tools/commit-gate/gate.py revoke --project . 2>&1 | Out-File -Encoding utf8 "$env:TEMP\gate-revoke.txt"
 "exit=$LASTEXITCODE" | Out-File -Append -Encoding utf8 "$env:TEMP\gate-revoke.txt"
+```
+
+Bash 版（落盘用 `$TMPDIR`，并紧跟一行记录退出码）：
+
+```bash
+python tools/commit-gate/gate.py revoke --project . > "$TMPDIR/gate-revoke.txt" 2>&1
+echo "exit=$?"
 ```
 
 一张通行证只对应一次提交+推送，推送成功后立刻作废。（该命令幂等，重复调用不报错。）

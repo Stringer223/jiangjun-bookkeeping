@@ -84,6 +84,7 @@ IN_PROGRESS_MARKERS = (
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    "sequencer",  # 多提交 cherry-pick 用 .git/sequencer，pre-commit 钩子豁免它，begin 就在这里拦
     "rebase-merge",
     "rebase-apply",
 )
@@ -162,8 +163,9 @@ def emit(message: str) -> None:
     默认按 GBK 编码，而调用方按 UTF-8 读 —— 直接用 print() 会让所有中文
     变成乱码，等于没给理由。（阶段 0 实测踩过，与 stdin 必须显式解码同源）
 
-    写 stdout 失败时退回 stderr 再试一次（钩子走的就是 stderr），
-    两条都断了才作罢 —— 见下面 except 里的说明。
+    写 stdout 失败时退回 stderr 再试一次 —— 调用方的 stdout 一旦断掉（被关掉，
+    或者被上层包装丢了），stderr 往往是唯一还能到达人的通道。两条都断了才作罢，
+    见下面 except 里的说明。
     """
     data = (message + "\n").encode("utf-8")
     try:
@@ -595,8 +597,14 @@ def cmd_begin(args: argparse.Namespace) -> int:
     # 那可能是上一轮留下的、仍然有效的通行证，不该因为一次失败的 begin 被销毁。
     try:
         (run_dir / "context.json").unlink(missing_ok=True)
-    except OSError:
-        pass
+    except OSError as exc:
+        # 不能静默吞掉：删不掉就说明它还在，而它正是下一轮 check 误判
+        # 「检查期间代码被改动」的源头（见上面那段说明）。当场报出来，
+        # 别让它留到 check 那一步再变成一个指向错方向的假线索。
+        return script_error(
+            f"无法删除上一轮的 context.json（{exc}）。"
+            "请确认没有别的进程正占用它，然后重跑 begin。"
+        )
 
     problem = ensure_repo(project)
     if problem:

@@ -48,9 +48,10 @@ from pathlib import Path
 # 写进各个 json 的版本号。将来改了字段含义就加一，便于识别旧文件。
 SCHEMA_VERSION = 1
 
-# 判官脚本的位置（相对仓库根）。它的存在与否用来判断「这是不是受管仓库」——
-# pre-commit 钩子也读同一个路径做自我禁用。
-GATE_SCRIPT_REL = Path("tools") / "commit-gate" / "gate.py"
+# 注：「这是不是受管仓库」的判据（`tools/commit-gate/gate.py` 是否存在）由
+# `.githooks/pre-commit` 自己判断 —— 钩子是 sh，读不到这里的 Python 常量。
+# 早先这里放过一个同名常量，零引用：改它不会有任何效果，却会让人以为改了判据，
+# 所以删掉，只留这条指路注释。
 
 # 一轮检查的运行时产物目录（相对仓库根）。整个 `.workbuddy/` 已被 .gitignore 忽略。
 RUN_DIR_REL = Path(".workbuddy") / "commit-gate" / "run"
@@ -91,10 +92,28 @@ IN_PROGRESS_MARKERS = (
 # 标为「疑似待确认」的条目不参与判定 —— 否则误报会直接把门禁变成噪音源。
 BLOCKING_LEVELS = ("critical", "high")
 
+# findings 两个枚举字段的合法取值。凡是不在这个集合里的取值都要**显式拒绝**，
+# 绝不能静默跳过 —— 理由见 _verify_finding_values（那是一处实测确认的 fail-open）。
+#
+# 这不是假想的失误：security-audit 技能自己的脚本输出的字段名是 `severity`，
+# agent 照抄字段名或手滑拼错（"hight"）都会命中。
+KNOWN_LEVELS = ("critical", "high", "medium", "low")
+
+# 「已核实」这个取值写成常量：它同时出现在取值集合（下面）与阻断判定
+# （「哪些是已确认的阻断级」）两处。各写一遍迟早会漂移成「集合改了、判定没改」，
+# 而那种漂移是**静默的** —— confirmed 会永远为空、阻断阈值随之失效，
+# 正是 _verify_finding_values 那段注释在防的同一类问题。
+CONFIRMED = "confirmed"
+KNOWN_CONFIDENCE = (CONFIRMED, "suspected")
+
 # 质量检查需要覆盖的文件类型。纯文档/配置变更不必跑质量检查 ——
 # 注意这个判断**由脚本做，不由 agent 声明**，否则又是一个
 # 「agent 自己宣布不用查」的后门。
-QUALITY_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"})
+#
+# `.py` 必须在内：本脚本自己就是 .py。早先没有它，后果是**门禁的判官逻辑
+# 从来没被质量检查覆盖过** —— 每次改 gate.py 都被判成「纯配置变更」。
+# 最不该出问题的地方反而长期没人看，这个盲区补上。
+QUALITY_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".py"})
 
 # git 的空 tree 常量。仓库还没有任何提交（unborn HEAD）时，用它作为 diff 基准。
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -142,12 +161,23 @@ def emit(message: str) -> None:
     注意：这里用 buffer 写 UTF-8 字节流。Python 在 Windows 上的 stdout
     默认按 GBK 编码，而调用方按 UTF-8 读 —— 直接用 print() 会让所有中文
     变成乱码，等于没给理由。（阶段 0 实测踩过，与 stdin 必须显式解码同源）
+
+    写 stdout 失败时退回 stderr 再试一次（钩子走的就是 stderr），
+    两条都断了才作罢 —— 见下面 except 里的说明。
     """
+    data = (message + "\n").encode("utf-8")
     try:
-        sys.stdout.buffer.write((message + "\n").encode("utf-8"))
+        sys.stdout.buffer.write(data)
         sys.stdout.buffer.flush()
     except Exception:
-        pass
+        # 不能只是 pass：这段话就是拒绝理由本身，吞掉之后调用方只看到一个
+        # 非 0 退出码、没有任何线索，而 reject() 的整段诊断（含「下一步做什么」）
+        # 都会消失，与「拒绝理由就是给用户看的诊断」这条设计直接相悖。
+        try:
+            sys.stderr.buffer.write(data)
+            sys.stderr.buffer.flush()
+        except Exception:
+            pass
 
 
 def reject(message: str) -> int:
@@ -248,14 +278,22 @@ def changed_files(project: Path, head: str) -> list[str] | None:
     用 `git diff --cached <base>` —— 比较的是**索引**（即将提交的内容）与基准提交，
     正是质量检查该覆盖的范围。head 为空（unborn HEAD）时用空 tree 作基准。
     过滤掉磁盘上已不存在的路径，避免把已删除文件也算进检查范围。
+
+    **必须带 `-z`。** git 在 `core.quotePath=true`（默认）下会把非 ASCII 路径
+    输出成 `"src/\\350\\264\\246..."` 这种**带引号的八进制转义**，于是下面
+    `(project / n).exists()` 永远为假、这个文件被静默踢出变更清单。
+    后果不是报错，而是**质量检查被整体跳过**：changedFiles 变空 → qualityRequired
+    变假 → begin 打印「不需要质量检查」并照发通行证，全程没有任何提示。
+    实测过：唯一变更是 `src/账单解析.py` 时就是这样。
+    `-z` 输出 NUL 分隔的原始路径，不做任何转义。
     """
     base = head or EMPTY_TREE
     code, out, _ = run_git(
-        project, "diff", "--cached", "--name-only", "--diff-filter=ACMR", base
+        project, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", base
     )
     if code != 0:
         return None
-    return [n for n in out.splitlines() if n.strip() and (project / n).exists()]
+    return [n for n in out.split("\x00") if n.strip() and (project / n).exists()]
 
 
 def quality_applicable(files: list[str]) -> bool:
@@ -315,9 +353,16 @@ def load_json(path: Path) -> tuple[str, dict | None]:
     if not path.exists():
         return STATUS_MISSING, None
     try:
-        return STATUS_OK, json.loads(path.read_text(encoding="utf-8-sig"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return STATUS_BROKEN, None
+    # 顶层必须是对象。若被写成了数组或字符串，后面每一处 `.get(...)` 都会抛
+    # AttributeError，被 main() 归成退出码 2「脚本自己出错」——而按本脚本的设计，
+    # 2 的含义是「该我修脚本」，那会把排查方向从这份 json 引到 gate.py 上。
+    # 归成 broken，让每个调用点给出贴切的文案。（与下面 scope 的处理同一个道理）
+    if not isinstance(data, dict):
+        return STATUS_BROKEN, None
+    return STATUS_OK, data
 
 
 def dump_json(path: Path, payload: dict) -> None:
@@ -414,9 +459,117 @@ def typecheck_errors(log_path: Path) -> list[str] | None:
     return [line.strip() for line in clean.splitlines() if TYPECHECK_ERROR_RE.search(line)]
 
 
+def _verified_findings(quality: dict) -> tuple[list | None, int | None]:
+    """取回 findings 并一次做完三道校验：是数组 → 每项是对象 → 取值合法。
+
+    通过返回 `(findings, None)`，否则返回 `(None, 退出码)`。
+
+    **为什么合成唯一入口。** 这三道校验与后面的 `histogram` 之间原本只靠
+    「谁写在上面」维持顺序，而 `histogram` 对不认识的取值是**静默跳过**的
+    （见 `_verify_finding_values` 里记的那处实测 fail-open）。改成「只能从这里
+    拿到 findings」之后，将来往 `_check_quality` 里插代码也插不出那个洞。
+
+    本函数自己先兜一次非对象，理由有两条：
+
+    - 后面 `_verify_finding_values` 要按字段取值，遇到字符串会抛 AttributeError，
+      被 `main()` 归成**退出码 2「脚本自己出错」** —— 而 2 的含义是「该我修脚本」，
+      会把排查方向从这份 json 引到 gate.py 上。
+      （`T-Q1`/`T-Q3`/`T-Q4`/`T-Q7` 反复在防的就是这类「报错指错方向」。）
+    - **不能改成「跳过非对象」**：跳过等于把一条可能是真问题的条目悄悄丢掉，
+      然后给出「通过」—— 那比报错严重得多。宁可拒绝。
+    """
+    findings = quality.get("findings")
+    if not isinstance(findings, list):
+        return None, reject(
+            "quality.json 缺少 findings 明细数组。"
+            "只给汇总数字不够 —— 门禁需要按明细自己重算，"
+            "否则「通过与否」就完全由 agent 自报了。"
+        )
+
+    malformed = [i for i, f in enumerate(findings) if not isinstance(f, dict)]
+    if malformed:
+        shown = ", ".join(str(i) for i in malformed[:5])
+        more = f"，另有 {len(malformed) - 5} 项" if len(malformed) > 5 else ""
+        return None, reject(
+            f"quality.json 的 findings 里有 {len(malformed)} 项不是对象（下标 {shown}{more}）。\n"
+            "  每一条发现都必须是带 file / line / level / confidence / title 的对象，"
+            "不能直接写成字符串或数字。\n"
+            "  请让 quality-engineer 重新产出。"
+        )
+
+    code = _verify_finding_values(findings)
+    if code is not None:
+        return None, code
+    return findings, None
+
+
+def _verify_finding_values(findings: list) -> int | None:
+    """校验每条 finding 的 level / confidence 取值是否在已知集合内。
+
+    通过返回 None，否则返回退出码 1。
+
+    **为什么必须显式拒绝，而不是跳过。** 取值不规范的条目（拼错成 "hight"、
+    写成中文、字段缺失、或者照抄了 security-audit 输出的 `severity`）会同时
+    绕过两道关：histogram 只往已知桶里累加，它进不去；阻断判定用的
+    `str(level).lower() in BLOCKING_LEVELS` 也匹配不上。只要 agent 顺手把
+    counts 也写成全 0，counts 核对还恰好对得上 —— 于是一条真的 critical
+    无声通过。实测确认过这条路径（level="hight" + counts 全 0 -> 放行）。
+
+    「跳过」等于把一条可能是真问题的发现悄悄丢掉再给出「通过」，
+    比报错严重得多。这里宁可拒绝。
+
+    调用点必须经由 `_verified_findings`（它保证每项都是对象、且位置在 histogram
+    **之前**）—— 绕过那一层单独调本函数，就又回到静默跳过。
+    """
+    for item in findings:
+        if not isinstance(item, dict):
+            # 显式拒绝而不是跳过：跳过等于把一条可能是真问题的条目悄悄丢掉。
+            # 同时这也让本函数**自己**不会因为被挪到非对象检查之前而抛
+            # AttributeError —— 那会被 main() 归成退出码 2「该我修脚本」，
+            # 把排查方向从这份 json 引到 gate.py 上。
+            return reject(
+                "quality.json 的 findings 里混入了非对象条目，无法校验取值。"
+                "请让 quality-engineer 重新产出。"
+            )
+    bad_level = [
+        item.get("level") for item in findings
+        if str(item.get("level", "")).lower() not in KNOWN_LEVELS
+    ]
+    if bad_level:
+        shown = ", ".join(repr(x)[:40] for x in bad_level[:5])
+        more = f"，另有 {len(bad_level) - 5} 条" if len(bad_level) > 5 else ""
+        return reject(
+            f"quality.json 的 findings 里有 {len(bad_level)} 条的 level 不在 "
+            f"{'/'.join(KNOWN_LEVELS)} 之内：{shown}{more}\n"
+            "  取值不在这个集合里的条目既不计入 counts、也不触发阻断阈值，"
+            "不能静默忽略 —— 那会让一条真问题无声消失。\n"
+            "  请让 quality-engineer 用规范取值重新产出"
+            "（注意 security-audit 输出的字段名是 severity，不能照抄）。"
+        )
+    bad_confidence = [
+        item.get("confidence") for item in findings
+        if str(item.get("confidence", "")).lower() not in KNOWN_CONFIDENCE
+    ]
+    if bad_confidence:
+        shown = ", ".join(repr(x)[:40] for x in bad_confidence[:5])
+        more = f"，另有 {len(bad_confidence) - 5} 条" if len(bad_confidence) > 5 else ""
+        return reject(
+            f"quality.json 的 findings 里有 {len(bad_confidence)} 条的 confidence 不在 "
+            f"{'/'.join(KNOWN_CONFIDENCE)} 之内：{shown}{more}\n"
+            "  取其它值（含字段缺失）时它会被当成「疑似」而不参与阻断判定，"
+            "与产出一方的本意不符。请重新产出。"
+        )
+    return None
+
+
 def histogram(findings: list, field: str) -> dict[str, int]:
-    """按某个字段统计 findings 的条数。gate 用它自己重算，不信 agent 填的汇总。"""
-    counts = {level: 0 for level in ("critical", "high", "medium", "low")}
+    """按某个字段统计 findings 的条数。gate 用它自己重算，不信 agent 填的汇总。
+
+    只统计 KNOWN_LEVELS 里的取值。取值不规范的条目必须先被
+    _verify_finding_values 拒掉 —— 这里不再重复报错，只负责计数。
+    桶直接用 KNOWN_LEVELS 而不是另写一份字面量：少一处将来会漂移的重复。
+    """
+    counts = {level: 0 for level in KNOWN_LEVELS}
     for item in findings:
         if not isinstance(item, dict):
             continue
@@ -550,7 +703,8 @@ def _check_tests(run_dir: Path, context: dict) -> int | None:
         )
     if status == STATUS_BROKEN:
         return reject(
-            "tests.json 存在但解析失败（可能被中断、写了一半，或编码不对）。"
+            "tests.json 存在但读不出对象（被中断、写了一半、编码不对，"
+            "或者顶层不是 JSON 对象）。"
             "请让 tester 重新产出 —— 注意必须写无 BOM 的 UTF-8。"
         )
     assert tests is not None
@@ -607,7 +761,10 @@ def _check_typecheck(run_dir: Path, context: dict) -> int | None:
             "请确认 tester 已经跑过 `npm run typecheck` 并写出该文件。"
         )
     if status == STATUS_BROKEN:
-        return reject("typecheck.json 存在但解析失败，请让 tester 重新产出（无 BOM UTF-8）。")
+        return reject(
+            "typecheck.json 存在但读不出对象（编码不对，或顶层不是 JSON 对象）。"
+            "请让 tester 重新产出（无 BOM UTF-8）。"
+        )
     assert tc is not None
 
     if tc.get("runId") != context.get("runId"):
@@ -644,7 +801,10 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
             "请确认 quality-engineer 已经跑完并写出该文件。"
         )
     if status == STATUS_BROKEN:
-        return reject("quality.json 存在但解析失败，请让 quality-engineer 重新产出。")
+        return reject(
+            "quality.json 存在但读不出对象（编码不对，或顶层不是 JSON 对象）。"
+            "请让 quality-engineer 重新产出。"
+        )
     assert quality is not None
 
     if quality.get("runId") != context.get("runId"):
@@ -652,10 +812,32 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
 
     # 覆盖范围必须是本次变更文件的超集。这条把「只查改动」从散文
     # 变成了机器可校验的不变式 —— 否则 agent 可以声称查了其实没查。
-    scanned = quality.get("scope", {}).get("scanned")
+    scope = quality.get("scope")
+    if not isinstance(scope, dict):
+        # scope 被写成字符串/数组时，直接 `.get("scanned")` 会抛 AttributeError，
+        # 又被归成退出码 2「脚本自己出错」—— 与 findings 那处是同一个坑，一并堵上。
+        return reject(
+            "quality.json 的 scope 不是对象（应为 {kind, scanned, skipped}），"
+            "没法确认这次检查覆盖了哪些文件。请让 quality-engineer 重新产出。"
+        )
+    scanned = scope.get("scanned")
     if not isinstance(scanned, list):
         return reject("quality.json 缺少 scope.scanned，无法确认检查覆盖了哪些文件。")
-    required = set(context.get("changedFiles") or [])
+    # 元素类型也要卡：scanned 里放对象/数组时 `set(scanned)` 会抛
+    # TypeError: unhashable type，冒到 main() 兜底被归成退出码 2「脚本自己出错」——
+    # 而 2 的含义是「该我修脚本」，会把排查方向从这份 json 引到 gate.py 上。
+    # 与 load_json / scope 那两处是同一个坑，一并堵上。
+    if any(not isinstance(name, str) for name in scanned):
+        bad = [name for name in scanned if not isinstance(name, str)]
+        shown = ", ".join(repr(x)[:40] for x in bad[:5])
+        more = f"，另有 {len(bad) - 5} 项" if len(bad) > 5 else ""
+        return reject(
+            f"quality.json 的 scope.scanned 里有 {len(bad)} 项不是字符串：{shown}{more}\n"
+            "  每个元素应当是一个文件路径字符串。请让 quality-engineer 重新产出。"
+        )
+    # changedFiles 的元素同理：非字符串的项在求差集时没有意义，
+    # 留着只会让「漏扫了哪些文件」这条判断悄悄失真。
+    required = {name for name in (context.get("changedFiles") or []) if isinstance(name, str)}
     missed = sorted(required - set(scanned))
     if missed:
         listing = "\n".join(f"    {name}" for name in missed)
@@ -665,35 +847,20 @@ def _check_quality(run_dir: Path, context: dict) -> int | None:
             "请让 quality-engineer 补齐这些文件后重新产出 quality.json。"
         )
 
-    findings = quality.get("findings")
-    if not isinstance(findings, list):
-        return reject(
-            "quality.json 缺少 findings 明细数组。"
-            "只给汇总数字不够 —— 门禁需要按明细自己重算，"
-            "否则「通过与否」就完全由 agent 自报了。"
-        )
-
-    # findings 里混入非对象（比如 agent 把一行文字直接塞进数组）必须**显式拒绝**。
-    # 后面几处都要按字段取值，遇到字符串会抛 AttributeError，被 main() 归成
-    # 退出码 2「脚本自己出错」——而按本脚本的设计，2 的含义是「该我修脚本」，
-    # 那会把排查方向从这份 json 引到 gate.py 上。实测踩过。
-    #
-    # **不能改成「跳过非对象」**：跳过等于把一条可能是真问题的条目悄悄丢掉，
-    # 然后给出「通过」—— 那比报错严重得多。宁可拒绝。
-    malformed = [i for i, f in enumerate(findings) if not isinstance(f, dict)]
-    if malformed:
-        shown = ", ".join(str(i) for i in malformed[:5])
-        more = f"，另有 {len(malformed) - 5} 项" if len(malformed) > 5 else ""
-        return reject(
-            f"quality.json 的 findings 里有 {len(malformed)} 项不是对象（下标 {shown}{more}）。\n"
-            "  每一条发现都必须是带 file / line / level / confidence / title 的对象，"
-            "不能直接写成字符串或数字。\n"
-            "  请让 quality-engineer 重新产出。"
-        )
+    # 三道校验（是数组 → 每项是对象 → 取值合法）与后面的计数之间，
+    # 顺序由 _verified_findings 内部保证，不再依赖这几段代码在本函数里的
+    # 相对位置 —— 那正是把它抽成唯一入口的原因（histogram 对不认识的取值
+    # 是静默跳过的，顺序写错就会重新打开那处 fail-open）。
+    findings, code = _verified_findings(quality)
+    if code is not None:
+        return code
+    assert findings is not None
 
     # 门禁自己重算，不信 agent 填的 counts / confirmed
     by_level = histogram(findings, "level")
-    confirmed_findings = [f for f in findings if str(f.get("confidence", "")).lower() == "confirmed"]
+    confirmed_findings = [
+        f for f in findings if str(f.get("confidence", "")).lower() == CONFIRMED
+    ]
     # confirmed 只统计**阻断级别**（critical/high）—— 它与 counts 的语义不同：
     # counts 是全量直方图，confirmed 是「够格阻断的有几条」。
     # 早先把四个级别都算进来，导致 agent 按契约只写 critical/high 时，
@@ -748,7 +915,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             "请重新从 `gate.py begin` 开始。"
         )
     if status == STATUS_BROKEN:
-        return script_error("context.json 存在但解析失败，文件可能被写坏了")
+        return script_error("context.json 存在但读不出对象（被写坏了，或顶层不是 JSON 对象）")
     assert context is not None
 
     expected_tree = context.get("tree")
